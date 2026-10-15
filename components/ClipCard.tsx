@@ -1,35 +1,62 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useEffect,
+  useEffectEvent,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import Link from "next/link";
 import Hls from "hls.js";
-import type { KickClip } from "@/lib/kick";
-import { recordAffinity } from "@/lib/affinity";
+import { kickChannelUrl, kickClipUrl, type Clip } from "@/lib/kick/types";
+import { recordAffinity, watchSignal } from "@/lib/affinity";
+import { onClipCommand, type ClipCommand } from "@/lib/commands";
 import { formatCount, formatDuration, timeAgo } from "@/lib/format";
-import { isLiked, setLiked as persistLiked, subscribeLikes } from "@/lib/likes";
 import {
+  followsStore,
+  hideCategory,
+  hideChannel,
+  isFollowing,
+  likesStore,
+  MAX_FOLLOWS,
+  setLiked,
+  toggleFollow,
+} from "@/lib/library";
+import { useChannelInfo } from "@/lib/live-client";
+import { toast } from "@/lib/toast";
+import { useI18n } from "@/components/I18nProvider";
+import ShareSheet from "@/components/ShareSheet";
+import Sheet, { SheetAction } from "@/components/Sheet";
+import {
+  CheckIcon,
   ExternalIcon,
   EyeIcon,
+  EyeOffIcon,
   HeartIcon,
   KickBoltIcon,
+  MoreIcon,
   PauseIcon,
   PlayIcon,
+  PlusIcon,
   ShareIcon,
   VolumeOffIcon,
   VolumeOnIcon,
 } from "@/components/icons";
 
 interface ClipCardProps {
-  clip: KickClip;
+  clip: Clip;
   index: number;
   active: boolean;
   preload: boolean;
   muted: boolean;
   volume: number;
+  dataSaver: boolean;
+  embed?: boolean;
   onToggleMute: () => void;
   onVolumeChange: (volume: number) => void;
-  // Returns true when the feed advanced to the next clip; false means this
-  // was the last card, so the clip replays in place instead.
+  // Returns true when the feed advanced to the next clip; false means the
+  // clip should replay in place (last card, or auto-advance is off).
   onEnded: () => boolean;
 }
 
@@ -39,6 +66,12 @@ interface Burst {
   y: number;
 }
 
+// Data saver caps playback at 480p, which keeps a clip around a few MB.
+const DATA_SAVER_MAX_HEIGHT = 480;
+// Below this, leaving the card is a strict-mode remount or a scroll
+// overshoot, not a real "skip" signal.
+const MIN_DWELL_FOR_SIGNAL_MS = 400;
+
 export default function ClipCard({
   clip,
   index,
@@ -46,32 +79,45 @@ export default function ClipCard({
   preload,
   muted,
   volume,
+  dataSaver,
+  embed = false,
   onToggleMute,
   onVolumeChange,
   onEnded,
 }: ClipCardProps) {
+  const { t, locale } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
-  const hlsRef = useRef<Hls | null>(null);
   const progressRef = useRef<HTMLDivElement>(null);
   const seekAreaRef = useRef<HTMLDivElement>(null);
   const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seekingRef = useRef(false);
+  const maxFractionRef = useRef(0);
 
   const liked = useSyncExternalStore(
-    subscribeLikes,
-    () => isLiked(clip.id),
+    likesStore.subscribe,
+    () => clip.id in likesStore.get(),
     () => false,
   );
+  const follows = useSyncExternalStore(
+    followsStore.subscribe,
+    followsStore.get,
+    followsStore.serverSnapshot,
+  );
+  const following = isFollowing(follows, clip.channel.slug);
+  const channelInfo = useChannelInfo(clip.channel.slug, active && !embed);
+  const live = channelInfo?.live ?? null;
+
   const [paused, setPaused] = useState(false);
   const [buffering, setBuffering] = useState(false);
   const [avatarBroken, setAvatarBroken] = useState(false);
   const [flash, setFlash] = useState<{ kind: "play" | "pause"; key: number } | null>(null);
   const [bursts, setBursts] = useState<Burst[]>([]);
-  const [toast, setToast] = useState<string | null>(null);
   const [scrubbing, setScrubbing] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
 
   const shouldLoad = active || preload;
-  const clipUrl = `https://kick.com/${clip.channel.slug}/clips/${clip.id}`;
+  const linkTarget = embed ? "_blank" : undefined;
 
   // Attach the HLS source only while the card is on (or next to) screen,
   // and tear it down when it scrolls far away to keep memory bounded.
@@ -81,22 +127,35 @@ export default function ClipCard({
 
     // Prefer hls.js over native playback: Chrome answers "maybe" to the HLS
     // MIME type but can't actually demux it. Safari takes the native branch.
+    let hls: Hls | null = null;
     if (Hls.isSupported()) {
-      const hls = new Hls({ maxBufferLength: 12, capLevelToPlayerSize: true });
-      hls.loadSource(clip.video_url);
-      hls.attachMedia(video);
-      hlsRef.current = hls;
+      const instance = new Hls({
+        maxBufferLength: dataSaver ? 6 : 12,
+        capLevelToPlayerSize: true,
+        startLevel: dataSaver ? 0 : -1,
+      });
+      if (dataSaver) {
+        instance.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+          let cap = 0;
+          data.levels.forEach((level, i) => {
+            if (level.height && level.height <= DATA_SAVER_MAX_HEIGHT) cap = i;
+          });
+          instance.autoLevelCapping = cap;
+        });
+      }
+      instance.loadSource(clip.videoUrl);
+      instance.attachMedia(video);
+      hls = instance;
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = clip.video_url;
+      video.src = clip.videoUrl;
     }
 
     return () => {
-      hlsRef.current?.destroy();
-      hlsRef.current = null;
+      hls?.destroy();
       video.removeAttribute("src");
       video.load();
     };
-  }, [shouldLoad, clip.video_url]);
+  }, [shouldLoad, clip.videoUrl, dataSaver]);
 
   // `paused` mirrors the element's play/pause events so the big play glyph
   // only shows when playback is actually stopped on the active card.
@@ -140,11 +199,19 @@ export default function ClipCard({
     }
   }, [muted, volume, shouldLoad]);
 
+  // Taste signal from how much of the clip was actually watched, recorded
+  // when the card stops being the active one.
+  const recordWatch = useEffectEvent((dwellMs: number) => {
+    if (dwellMs < MIN_DWELL_FOR_SIGNAL_MS) return;
+    recordAffinity(clip, watchSignal(maxFractionRef.current, dwellMs));
+  });
+
   useEffect(() => {
-    if (!toast) return;
-    const t = setTimeout(() => setToast(null), 1600);
-    return () => clearTimeout(t);
-  }, [toast]);
+    if (!active) return;
+    const started = Date.now();
+    maxFractionRef.current = 0;
+    return () => recordWatch(Date.now() - started);
+  }, [active]);
 
   function togglePlay() {
     const video = videoRef.current;
@@ -159,21 +226,66 @@ export default function ClipCard({
   }
 
   function like(at?: { x: number; y: number }) {
-    if (!liked) recordAffinity(clip, 3);
-    persistLiked(clip.id, true);
-    if (at) {
-      const burst = { key: Date.now(), ...at };
-      setBursts((b) => [...b.slice(-3), burst]);
-      setTimeout(
-        () => setBursts((b) => b.filter((x) => x.key !== burst.key)),
-        850,
-      );
+    if (!liked) {
+      recordAffinity(clip, 3);
+      setLiked(clip, true);
     }
+    const section = videoRef.current?.closest("section");
+    const point = at ?? {
+      x: (section?.clientWidth ?? 0) / 2,
+      y: (section?.clientHeight ?? 0) / 2,
+    };
+    const burst = { key: Date.now(), ...point };
+    setBursts((b) => [...b.slice(-3), burst]);
+    setTimeout(() => setBursts((b) => b.filter((x) => x.key !== burst.key)), 850);
   }
 
   function toggleLike() {
     if (!liked) recordAffinity(clip, 3);
-    persistLiked(clip.id, !liked);
+    setLiked(clip, !liked);
+  }
+
+  function seekBy(seconds: number) {
+    const video = videoRef.current;
+    if (!video || !video.duration) return;
+    video.currentTime = Math.max(0, Math.min(video.duration - 0.1, video.currentTime + seconds));
+  }
+
+  const handleCommand = useEffectEvent((cmd: ClipCommand) => {
+    if (cmd.type === "toggle-play") togglePlay();
+    else if (cmd.type === "like") like();
+    else if (cmd.type === "share") setShareOpen(true);
+    else if (cmd.type === "seek") seekBy(cmd.by);
+  });
+
+  useEffect(() => {
+    if (!active) return;
+    return onClipCommand((cmd) => handleCommand(cmd));
+  }, [active]);
+
+  function handleFollow() {
+    const wasFollowing = following;
+    if (!toggleFollow(clip.channel)) {
+      toast(t("clip.followLimit", { n: MAX_FOLLOWS }));
+      return;
+    }
+    if (!wasFollowing) recordAffinity(clip, 2);
+    toast(t(wasFollowing ? "clip.unfollowed" : "clip.followed", { name: clip.channel.username }));
+  }
+
+  function hide(kind: "channel" | "category") {
+    setMenuOpen(false);
+    recordAffinity(clip, -3);
+    const category = clip.category;
+    if (kind === "channel") hideChannel(clip.channel);
+    else if (category) hideCategory(category);
+    toast(t("clip.hiddenToast"), {
+      label: t("clip.undo"),
+      run: () => {
+        if (kind === "channel") hideChannel(clip.channel, false);
+        else if (category) hideCategory(category, false);
+      },
+    });
   }
 
   // Single tap toggles playback, double tap likes.
@@ -195,20 +307,20 @@ export default function ClipCard({
   // The bar and its aria value update imperatively to avoid re-rendering
   // the card several times per second.
   function paintProgress(frac: number) {
-    if (progressRef.current) {
-      progressRef.current.style.width = `${frac * 100}%`;
-    }
+    if (progressRef.current) progressRef.current.style.width = `${frac * 100}%`;
     seekAreaRef.current?.setAttribute("aria-valuenow", String(Math.round(frac * 100)));
   }
 
   function handleTimeUpdate() {
-    if (seekingRef.current) return;
     const video = videoRef.current;
     if (!video || !video.duration) return;
-    paintProgress(video.currentTime / video.duration);
+    const frac = video.currentTime / video.duration;
+    if (frac > maxFractionRef.current) maxFractionRef.current = frac;
+    if (!seekingRef.current) paintProgress(frac);
   }
 
   function handleEnded() {
+    maxFractionRef.current = 1;
     if (onEnded()) return;
     const video = videoRef.current;
     if (video && active) {
@@ -242,39 +354,34 @@ export default function ClipCard({
     setScrubbing(false);
   }
 
-  async function share() {
-    const payload = {
-      title: clip.title,
-      text: `${clip.title} — ${clip.channel.username} on Kick`,
-      url: clipUrl,
-    };
-    try {
-      if (navigator.share) {
-        await navigator.share(payload);
-      } else {
-        await navigator.clipboard.writeText(clipUrl);
-        setToast("Link copied");
-      }
-    } catch {
-      // user dismissed the share sheet
+  function handleSeekKey(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      e.preventDefault();
+      e.stopPropagation();
+      seekBy(e.key === "ArrowLeft" ? -5 : 5);
     }
   }
 
-  const likeTotal = clip.likes_count + (liked ? 1 : 0);
+  const likeTotal = clip.likes + (liked ? 1 : 0);
+  const channelHref = `/c/${clip.channel.slug}`;
 
   return (
     <section
       data-index={index}
-      className="relative h-dvh w-full snap-start snap-always overflow-hidden bg-ink"
+      aria-roledescription="clip"
+      aria-label={`${clip.channel.username}: ${clip.title}`}
+      className="relative h-full w-full snap-start snap-always overflow-hidden bg-ink"
     >
       {/* Blurred backdrop fills the letterbox around the 16:9 clip */}
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img
-        src={clip.thumbnail_url}
-        alt=""
-        aria-hidden
-        className="absolute inset-0 h-full w-full scale-125 object-cover opacity-30 blur-3xl"
-      />
+      {clip.thumbnailUrl && (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={clip.thumbnailUrl}
+          alt=""
+          aria-hidden
+          className="absolute inset-0 h-full w-full scale-125 object-cover opacity-30 blur-3xl"
+        />
+      )}
 
       <div
         className="absolute inset-0 flex cursor-pointer items-center justify-center"
@@ -282,7 +389,7 @@ export default function ClipCard({
       >
         <video
           ref={videoRef}
-          poster={clip.thumbnail_url}
+          poster={clip.thumbnailUrl || undefined}
           playsInline
           muted
           preload="metadata"
@@ -296,16 +403,15 @@ export default function ClipCard({
             key={flash.key}
             className="animate-play-flash pointer-events-none absolute rounded-full bg-ink/60 p-6 text-fog"
           >
-            {flash.kind === "play" ? (
-              <PlayIcon width={36} height={36} />
-            ) : (
-              <PauseIcon width={36} height={36} />
-            )}
+            {flash.kind === "play" ? <PlayIcon width={36} height={36} /> : <PauseIcon width={36} height={36} />}
           </div>
         )}
 
         {active && paused && !flash && (
-          <div className="pointer-events-none absolute rounded-full bg-ink/50 p-6 text-fog/90">
+          <div
+            className="pointer-events-none absolute rounded-full bg-ink/50 p-6 text-fog/90"
+            aria-label={t("clip.paused")}
+          >
             <PlayIcon width={36} height={36} />
           </div>
         )}
@@ -330,36 +436,60 @@ export default function ClipCard({
       </div>
 
       {/* Bottom gradient for legibility */}
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 h-56 bg-gradient-to-t from-ink/95 via-ink/50 to-transparent" />
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 h-64 bg-gradient-to-t from-ink/95 via-ink/50 to-transparent" />
 
       {/* Clip metadata */}
       <div
         data-ui="clip-meta"
         className="absolute bottom-6 left-4 right-20 z-10 flex flex-col gap-2 sm:bottom-9 sm:left-6"
       >
-        <Link
-          href={`/c/${clip.channel.slug}`}
-          className="w-fit font-display text-lg font-extrabold tracking-tight text-fog transition-colors hover:text-kick"
-          title={`More clips from ${clip.channel.username}`}
-        >
-          @{clip.channel.username}
-        </Link>
-        <p className="line-clamp-2 max-w-xl text-sm text-fog/90">{clip.title}</p>
-        <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] text-fog/60">
+        <div className="flex flex-wrap items-center gap-2">
           <Link
-            href={`/g/${clip.category.slug}`}
-            className="border border-kick/40 bg-kick/10 px-2 py-0.5 uppercase tracking-wide text-kick transition-colors hover:bg-kick hover:text-ink"
-            title={`More ${clip.category.name} clips`}
+            href={channelHref}
+            target={linkTarget}
+            className="w-fit font-display text-lg font-extrabold tracking-tight text-fog transition-colors hover:text-kick"
+            title={t("clip.moreFrom", { name: clip.channel.username })}
           >
-            {clip.category.name}
+            @{clip.channel.username}
           </Link>
+          {live && (
+            <a
+              href={kickChannelUrl(clip.channel.slug)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="animate-rise-in flex items-center gap-1.5 rounded-sm bg-red-600 px-1.5 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider text-white shadow-[0_0_12px_rgba(220,38,38,0.6)] transition-transform hover:scale-105"
+              title={t("clip.liveNow", { name: clip.channel.username })}
+            >
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" />
+              {t("clip.live")}
+              <span className="font-medium normal-case tracking-normal opacity-90">
+                · {formatCount(live.viewers, locale)}
+              </span>
+            </a>
+          )}
+        </div>
+        {clip.title && <p className="line-clamp-2 max-w-xl text-sm text-fog/90">{clip.title}</p>}
+        <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] text-fog/60">
+          {clip.category && (
+            <Link
+              href={`/g/${clip.category.slug}`}
+              target={linkTarget}
+              className="border border-kick/40 bg-kick/10 px-2 py-0.5 uppercase tracking-wide text-kick transition-colors hover:bg-kick hover:text-ink"
+              title={t("clip.moreCategory", { name: clip.category.name })}
+            >
+              {clip.category.name}
+            </Link>
+          )}
+          <span className="flex items-center gap-1" title={t("clip.views")}>
+            <EyeIcon width={12} height={12} />
+            <span suppressHydrationWarning>{formatCount(clip.views, locale)}</span>
+          </span>
+          <span aria-hidden>·</span>
           <span>{formatDuration(clip.duration)}</span>
-          <span>·</span>
-          <span>{timeAgo(clip.created_at)}</span>
-          {clip.is_mature && (
-            <span className="border border-red-500/50 bg-red-500/10 px-1.5 py-0.5 text-red-400">
-              18+
-            </span>
+          <span aria-hidden>·</span>
+          <span suppressHydrationWarning>{timeAgo(clip.createdAt, locale, t("time.justNow"))}</span>
+          {clip.mature && (
+            <span className="border border-red-500/50 bg-red-500/10 px-1.5 py-0.5 text-red-400">18+</span>
           )}
         </div>
       </div>
@@ -367,117 +497,126 @@ export default function ClipCard({
       {/* Action rail */}
       <aside
         data-ui="action-rail"
-        className="absolute bottom-6 right-2 z-10 flex flex-col items-center gap-5 sm:bottom-9 sm:right-4"
+        className="absolute bottom-6 right-2 z-10 flex flex-col items-center gap-4 sm:bottom-9 sm:right-4"
       >
-        <Link
-          href={`/c/${clip.channel.slug}`}
-          aria-label={`More clips from ${clip.channel.username}`}
-          className="mb-1 block h-12 w-12 overflow-hidden rounded-full ring-2 ring-kick transition-transform hover:scale-110"
-        >
-          {clip.channel.profile_picture && !avatarBroken ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={clip.channel.profile_picture}
-              alt={clip.channel.username}
-              className="h-full w-full object-cover"
-              onError={() => setAvatarBroken(true)}
-            />
-          ) : (
-            <span className="flex h-full w-full items-center justify-center bg-smoke font-display text-lg font-extrabold text-kick">
-              {clip.channel.username.charAt(0).toUpperCase()}
-            </span>
+        <div className="relative mb-2">
+          <Link
+            href={channelHref}
+            target={linkTarget}
+            aria-label={t("clip.moreFrom", { name: clip.channel.username })}
+            className={`block h-12 w-12 overflow-hidden rounded-full ring-2 transition-transform hover:scale-110 ${
+              live ? "animate-live-ring ring-red-500" : "ring-kick"
+            }`}
+          >
+            {clip.channel.avatar && !avatarBroken ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={clip.channel.avatar}
+                alt={clip.channel.username}
+                className="h-full w-full object-cover"
+                onError={() => setAvatarBroken(true)}
+              />
+            ) : (
+              <span className="flex h-full w-full items-center justify-center bg-smoke font-display text-lg font-extrabold text-kick">
+                {clip.channel.username.charAt(0).toUpperCase()}
+              </span>
+            )}
+          </Link>
+          {!embed && (
+            <button
+              onClick={handleFollow}
+              aria-pressed={following}
+              aria-label={t(following ? "clip.unfollow" : "clip.follow")}
+              title={t(following ? "clip.unfollow" : "clip.follow")}
+              className={`absolute -bottom-2 left-1/2 flex h-5 w-5 -translate-x-1/2 items-center justify-center rounded-full ring-2 ring-ink transition-transform hover:scale-110 ${
+                following ? "bg-fog text-ink" : "bg-kick text-ink"
+              }`}
+            >
+              {following ? (
+                <CheckIcon width={12} height={12} strokeWidth={3} />
+              ) : (
+                <PlusIcon width={12} height={12} strokeWidth={3} />
+              )}
+            </button>
           )}
-        </Link>
+        </div>
 
         <button
           onClick={toggleLike}
           className="group flex flex-col items-center gap-1"
-          aria-label={liked ? "Unlike" : "Like"}
+          aria-label={t(liked ? "clip.unlike" : "clip.like")}
+          aria-pressed={liked}
         >
           <span
             className={`rounded-full bg-ink/50 p-2.5 backdrop-blur-sm transition-all group-hover:scale-110 ${
-              liked
-                ? "text-kick drop-shadow-[0_0_12px_rgba(83,252,24,0.6)]"
-                : "text-fog"
+              liked ? "text-kick drop-shadow-[0_0_12px_rgba(83,252,24,0.6)]" : "text-fog"
             }`}
           >
             <HeartIcon filled={liked} width={26} height={26} />
           </span>
-          <span className="font-mono text-[11px] text-fog/80">
-            {formatCount(likeTotal)}
+          <span className="font-mono text-[11px] text-fog/80" suppressHydrationWarning>
+            {formatCount(likeTotal, locale)}
           </span>
         </button>
 
-        <div className="flex flex-col items-center gap-1" title="Views">
-          <span className="rounded-full bg-ink/50 p-2.5 text-fog backdrop-blur-sm">
-            <EyeIcon width={26} height={26} />
-          </span>
-          <span className="font-mono text-[11px] text-fog/80">
-            {formatCount(clip.view_count)}
-          </span>
-        </div>
-
         <button
-          onClick={share}
+          onClick={() => setShareOpen(true)}
           className="group flex flex-col items-center gap-1"
-          aria-label="Share clip"
+          aria-label={t("clip.share")}
         >
           <span className="rounded-full bg-ink/50 p-2.5 text-fog backdrop-blur-sm transition-transform group-hover:scale-110">
             <ShareIcon width={26} height={26} />
           </span>
-          <span className="font-mono text-[11px] text-fog/80">Share</span>
+          <span className="font-mono text-[11px] text-fog/80">{t("clip.share")}</span>
         </button>
 
         <a
-          href={clipUrl}
+          href={kickClipUrl(clip)}
           target="_blank"
           rel="noopener noreferrer"
           className="group flex flex-col items-center gap-1"
-          aria-label="Watch on Kick"
+          aria-label={t("clip.watchOnKick")}
         >
           <span className="rounded-full border border-kick/50 bg-ink/50 p-2.5 text-kick backdrop-blur-sm transition-transform group-hover:scale-110">
             <ExternalIcon width={24} height={24} />
           </span>
-          <span className="font-mono text-[11px] text-fog/80">Kick</span>
+          <span className="font-mono text-[11px] text-fog/80">{t("clip.kick")}</span>
         </a>
+
+        {!embed && (
+          <button
+            onClick={() => setMenuOpen(true)}
+            className="rounded-full bg-ink/50 p-2 text-fog/80 backdrop-blur-sm transition-transform hover:scale-110"
+            aria-label={t("clip.more")}
+          >
+            <MoreIcon width={20} height={20} />
+          </button>
+        )}
 
         <div className="flex flex-col items-center gap-1 sm:hidden">
           <button
             onClick={() => onVolumeChange(Math.min(1, Math.round((volume + 0.1) * 10) / 10))}
-            className="rounded-full bg-ink/50 px-3 py-1.5 font-mono text-base font-bold text-fog backdrop-blur-sm"
-            aria-label="Volume up"
+            className="rounded-full bg-ink/50 px-2.5 py-1 font-mono text-sm font-bold text-fog backdrop-blur-sm"
+            aria-label={t("volume.up")}
           >
             +
           </button>
           <button
             onClick={onToggleMute}
-            className="rounded-full bg-ink/50 p-2.5 text-fog backdrop-blur-sm"
-            aria-label={muted ? "Unmute" : "Mute"}
+            className="rounded-full bg-ink/50 p-2 text-fog backdrop-blur-sm"
+            aria-label={t(muted ? "volume.unmute" : "volume.mute")}
           >
-            {muted ? (
-              <VolumeOffIcon width={22} height={22} />
-            ) : (
-              <VolumeOnIcon width={22} height={22} />
-            )}
+            {muted ? <VolumeOffIcon width={20} height={20} /> : <VolumeOnIcon width={20} height={20} />}
           </button>
           <button
             onClick={() => onVolumeChange(Math.max(0, Math.round((volume - 0.1) * 10) / 10))}
-            className="rounded-full bg-ink/50 px-3 py-1.5 font-mono text-base font-bold text-fog backdrop-blur-sm"
-            aria-label="Volume down"
+            className="rounded-full bg-ink/50 px-2.5 py-1 font-mono text-sm font-bold text-fog backdrop-blur-sm"
+            aria-label={t("volume.down")}
           >
             −
           </button>
         </div>
       </aside>
-
-      {toast && (
-        <div className="animate-toast-in absolute bottom-28 left-1/2 z-20 -translate-x-1/2">
-          <span className="flex items-center gap-2 border border-kick/40 bg-ink/90 px-4 py-2 font-mono text-xs text-kick backdrop-blur-md">
-            <KickBoltIcon width={12} height={12} />
-            {toast}
-          </span>
-        </div>
-      )}
 
       {/* Playback progress — the thin bar sits inside a taller hit area so
           it stays draggable on touch screens without cluttering the UI. */}
@@ -488,17 +627,15 @@ export default function ClipCard({
         onPointerMove={handleSeekMove}
         onPointerUp={handleSeekUp}
         onPointerCancel={handleSeekUp}
+        onKeyDown={handleSeekKey}
+        tabIndex={active ? 0 : -1}
         role="slider"
-        aria-label="Seek"
+        aria-label={t("clip.seek")}
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={0}
       >
-        <div
-          className={`w-full bg-white/10 transition-[height] duration-150 ${
-            scrubbing ? "h-1.5" : "h-0.5"
-          }`}
-        >
+        <div className={`w-full bg-white/10 transition-[height] duration-150 ${scrubbing ? "h-1.5" : "h-0.5"}`}>
           <div
             ref={progressRef}
             className="h-full bg-kick shadow-[0_0_8px_rgba(83,252,24,0.8)]"
@@ -506,6 +643,46 @@ export default function ClipCard({
           />
         </div>
       </div>
+
+      <ShareSheet clip={clip} open={shareOpen} onClose={() => setShareOpen(false)} />
+
+      <Sheet
+        open={menuOpen}
+        title={t("clip.more")}
+        onClose={() => setMenuOpen(false)}
+        closeLabel={t("share.close")}
+      >
+        <div className="flex flex-col">
+          <SheetAction
+            icon={<EyeOffIcon width={18} height={18} />}
+            label={t("clip.notInterestedChannel", { name: `@${clip.channel.username}` })}
+            onClick={() => hide("channel")}
+          />
+          {clip.category && (
+            <SheetAction
+              icon={<EyeOffIcon width={18} height={18} />}
+              label={t("clip.notInterestedCategory", { name: clip.category.name })}
+              onClick={() => hide("category")}
+            />
+          )}
+          <SheetAction
+            icon={following ? <CheckIcon width={18} height={18} /> : <PlusIcon width={18} height={18} />}
+            label={t(following ? "clip.unfollow" : "clip.follow")}
+            onClick={() => {
+              setMenuOpen(false);
+              handleFollow();
+            }}
+          />
+          <SheetAction
+            tone="kick"
+            icon={<KickBoltIcon width={18} height={18} />}
+            label={t("clip.watchOnKick")}
+            href={kickClipUrl(clip)}
+            external
+            onClick={() => setMenuOpen(false)}
+          />
+        </div>
+      </Sheet>
     </section>
   );
 }

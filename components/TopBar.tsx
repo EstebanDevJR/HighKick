@@ -1,39 +1,53 @@
 "use client";
 
 import Link from "next/link";
-import type { ClipSort, ClipTime } from "@/lib/kick";
+import { useI18n } from "@/components/I18nProvider";
+import type { ClipSort, ClipTime } from "@/lib/kick/types";
+import type { MessageKey } from "@/lib/i18n/messages";
+import { openSearch } from "@/lib/commands";
 import {
   ClockIcon,
   FlameIcon,
-  GithubIcon,
   KickBoltIcon,
+  SearchIcon,
   ShuffleIcon,
+  UsersIcon,
   VolumeOffIcon,
   VolumeOnIcon,
 } from "@/components/icons";
 
-export type FeedMode = "mix" | ClipSort;
+export type FeedMode = "mix" | "following" | ClipSort;
 
-const MODE_TABS: { value: FeedMode; label: string; icon: typeof FlameIcon }[] = [
-  { value: "mix", label: "MIX", icon: ShuffleIcon },
-  { value: "view", label: "TOP", icon: FlameIcon },
-  { value: "date", label: "NEW", icon: ClockIcon },
+const MODE_TABS: {
+  value: FeedMode;
+  label: MessageKey;
+  title: MessageKey;
+  icon: typeof FlameIcon;
+}[] = [
+  { value: "mix", label: "mode.mix", title: "mode.mixTitle", icon: ShuffleIcon },
+  { value: "following", label: "mode.following", title: "mode.followingTitle", icon: UsersIcon },
+  { value: "view", label: "mode.top", title: "mode.topTitle", icon: FlameIcon },
+  { value: "date", label: "mode.new", title: "mode.newTitle", icon: ClockIcon },
 ];
 
-const TIME_OPTIONS: { value: ClipTime; label: string }[] = [
-  { value: "day", label: "24H" },
-  { value: "week", label: "7D" },
-  { value: "month", label: "30D" },
-  { value: "all", label: "ALL" },
+export const TIME_OPTIONS: { value: ClipTime; label: MessageKey }[] = [
+  { value: "day", label: "time.day" },
+  { value: "week", label: "time.week" },
+  { value: "month", label: "time.month" },
+  { value: "all", label: "time.all" },
 ];
 
 interface TopBarProps {
   mode: FeedMode;
+  modes: FeedMode[];
   time: ClipTime;
   muted: boolean;
   volume: number;
   hideMature: boolean;
   scopeLabel?: string;
+  scopeHref?: string;
+  // Embedded players get a stripped-down bar that opens the full app.
+  embedHref?: string;
   onModeChange: (mode: FeedMode) => void;
   onTimeChange: (time: ClipTime) => void;
   onToggleMute: () => void;
@@ -43,49 +57,68 @@ interface TopBarProps {
 
 export default function TopBar({
   mode,
+  modes,
   time,
   muted,
   volume,
   hideMature,
   scopeLabel,
+  scopeHref = "/",
+  embedHref,
   onModeChange,
   onTimeChange,
   onToggleMute,
   onVolumeChange,
   onToggleMature,
 }: TopBarProps) {
-  // MIX is a global deck; inside a channel/category feed only TOP/NEW apply.
-  const tabs = scopeLabel
-    ? MODE_TABS.filter((t) => t.value !== "mix")
-    : MODE_TABS;
+  const { t } = useI18n();
+  const tabs = MODE_TABS.filter((tab) => modes.includes(tab.value));
+  const showTime = mode === "view" || mode === "date";
+
   function cycleTime() {
-    const idx = TIME_OPTIONS.findIndex((t) => t.value === time);
+    const idx = TIME_OPTIONS.findIndex((o) => o.value === time);
     onTimeChange(TIME_OPTIONS[(idx + 1) % TIME_OPTIONS.length].value);
   }
 
-  return (
-    <header className="pointer-events-none fixed inset-x-0 top-0 z-40 bg-gradient-to-b from-ink/90 via-ink/50 to-transparent pb-8">
-      <div className="pointer-events-auto mx-auto flex max-w-5xl items-center justify-between gap-2 px-3 py-3 sm:gap-3 sm:px-4">
-        <Link
-          href="/"
-          data-ui="logo"
-          className="flex shrink-0 items-center gap-1.5"
-          aria-label="KickTok home"
-        >
-          <span className="flex items-center gap-1 bg-kick px-2 py-1 font-display text-lg font-extrabold leading-none text-ink">
-            <KickBoltIcon width={14} height={14} />
-            KICK
-          </span>
-          <span className="hidden font-display text-lg font-extrabold leading-none tracking-tight text-fog min-[400px]:inline">
-            TOK
-          </span>
-        </Link>
+  const logo = (
+    <>
+      <span className="flex items-center gap-1 bg-kick px-2 py-1 font-display text-lg font-extrabold leading-none text-ink">
+        <KickBoltIcon width={14} height={14} />
+        HIGH
+      </span>
+      <span className="font-display text-lg font-extrabold leading-none tracking-tight text-fog">KICK</span>
+    </>
+  );
 
-        {scopeLabel && (
+  return (
+    <header className="pointer-events-none absolute inset-x-0 top-0 z-40 bg-gradient-to-b from-ink/90 via-ink/50 to-transparent pb-8">
+      <div className="pointer-events-auto mx-auto flex max-w-5xl items-center justify-between gap-2 px-3 py-3 sm:gap-3 sm:px-4">
+        {embedHref ? (
+          <a
+            href={embedHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex shrink-0 items-center gap-1.5"
+            title={t("embed.openFull")}
+          >
+            {logo}
+          </a>
+        ) : (
           <Link
             href="/"
+            data-ui="logo"
+            className={`shrink-0 items-center gap-1.5 md:invisible ${scopeLabel ? "hidden sm:flex" : "flex"}`}
+            aria-label={t("nav.homeLabel")}
+          >
+            {logo}
+          </Link>
+        )}
+
+        {scopeLabel && !embedHref && (
+          <Link
+            href={scopeHref}
             data-ui="scope-pill"
-            title="Back to the global feed"
+            title={t("nav.backToFeed")}
             className="group flex min-w-0 shrink items-center gap-1.5 rounded-full border border-kick/40 bg-kick/10 px-3 py-1 font-mono text-xs font-semibold text-kick backdrop-blur-md transition-colors hover:bg-kick hover:text-ink"
           >
             <span className="truncate">{scopeLabel}</span>
@@ -95,76 +128,71 @@ export default function TopBar({
           </Link>
         )}
 
-        <nav
-          data-ui="mode-nav"
-          className="flex min-w-0 shrink items-center gap-1 rounded-full border border-white/10 bg-smoke/80 p-1 backdrop-blur-md"
-        >
-          {tabs.map((tab) => {
-            const Icon = tab.icon;
-            const isActive = mode === tab.value;
-            return (
-              <button
-                key={tab.value}
-                onClick={() => onModeChange(tab.value)}
-                className={`flex items-center gap-1 rounded-full px-2.5 py-1 font-mono text-xs font-semibold transition-colors sm:px-3 ${
-                  isActive ? "bg-kick text-ink" : "text-fog/60 hover:text-fog"
-                }`}
-                title={
-                  tab.value === "mix"
-                    ? "Shuffled mix — tap again to reshuffle"
-                    : tab.value === "view"
-                      ? "Most viewed"
-                      : "Newest"
-                }
-              >
-                <Icon width={12} height={12} className="shrink-0" />
-                <span className="hidden min-[420px]:inline">{tab.label}</span>
-              </button>
-            );
-          })}
-        </nav>
+        {tabs.length > 1 && (
+          <nav
+            data-ui="mode-nav"
+            aria-label="Feed"
+            className="flex min-w-0 shrink items-center gap-1 rounded-full border border-white/10 bg-smoke/80 p-1 backdrop-blur-md"
+          >
+            {tabs.map((tab) => {
+              const Icon = tab.icon;
+              const isActive = mode === tab.value;
+              return (
+                <button
+                  key={tab.value}
+                  onClick={() => onModeChange(tab.value)}
+                  aria-pressed={isActive}
+                  aria-label={t(tab.label)}
+                  className={`flex items-center gap-1 rounded-full px-2.5 py-1 font-mono text-xs font-semibold transition-colors sm:px-3 ${
+                    isActive ? "bg-kick text-ink" : "text-fog/60 hover:text-fog"
+                  }`}
+                  title={t(tab.title)}
+                >
+                  <Icon width={12} height={12} className="shrink-0" />
+                  <span className={isActive ? "hidden min-[360px]:inline" : "hidden sm:inline"}>
+                    {t(tab.label)}
+                  </span>
+                </button>
+              );
+            })}
+          </nav>
+        )}
 
         <div data-ui="top-controls" className="flex shrink-0 items-center gap-1.5 sm:gap-2">
-          {mode !== "mix" && (
+          {showTime && (
             <button
               onClick={cycleTime}
               className="rounded-full border border-kick/40 bg-smoke/80 px-3 py-1.5 font-mono text-xs font-semibold text-kick backdrop-blur-md transition-colors hover:bg-kick hover:text-ink"
-              title="Time range — tap to cycle"
+              title={t("time.title")}
             >
-              {TIME_OPTIONS.find((t) => t.value === time)?.label}
+              {t(TIME_OPTIONS.find((o) => o.value === time)?.label ?? "time.day")}
             </button>
           )}
 
-          <button
-            onClick={onToggleMature}
-            aria-pressed={hideMature}
-            className={`rounded-full border px-2.5 py-1.5 font-mono text-xs font-semibold backdrop-blur-md transition-colors ${
-              hideMature
-                ? "border-white/10 bg-smoke/80 text-fog/40 line-through"
-                : "border-red-500/40 bg-smoke/80 text-red-400 hover:border-red-500/70"
-            }`}
-            title={
-              hideMature
-                ? "18+ clips hidden — tap to show"
-                : "18+ clips shown — tap to hide"
-            }
-          >
-            18+
-          </button>
+          {!embedHref && (
+            <button
+              onClick={onToggleMature}
+              aria-pressed={hideMature}
+              className={`rounded-full border px-2.5 py-1.5 font-mono text-xs font-semibold backdrop-blur-md transition-colors ${
+                hideMature
+                  ? "border-white/10 bg-smoke/80 text-fog/40 line-through"
+                  : "border-red-500/40 bg-smoke/80 text-red-400 hover:border-red-500/70"
+              }`}
+              title={t(hideMature ? "mature.hiddenTitle" : "mature.shownTitle")}
+            >
+              18+
+            </button>
+          )}
 
-          <div className="group hidden items-center sm:flex">
+          <div className={`group items-center ${embedHref ? "flex" : "hidden sm:flex"}`}>
             <button
               onClick={onToggleMute}
               className="rounded-full border border-white/10 bg-smoke/80 p-2 text-fog/80 backdrop-blur-md transition-colors hover:border-kick/40 hover:text-kick"
-              aria-label={muted ? "Unmute" : "Mute"}
+              aria-label={t(muted ? "volume.unmute" : "volume.mute")}
             >
-              {muted ? (
-                <VolumeOffIcon width={16} height={16} />
-              ) : (
-                <VolumeOnIcon width={16} height={16} />
-              )}
+              {muted ? <VolumeOffIcon width={16} height={16} /> : <VolumeOnIcon width={16} height={16} />}
             </button>
-            <div className="max-w-0 overflow-hidden opacity-0 transition-all duration-200 group-hover:max-w-[5rem] group-hover:opacity-100">
+            <div className="max-w-0 overflow-hidden opacity-0 transition-all duration-200 group-focus-within:max-w-[5rem] group-focus-within:opacity-100 group-hover:max-w-[5rem] group-hover:opacity-100">
               <input
                 type="range"
                 min="0"
@@ -173,20 +201,21 @@ export default function TopBar({
                 value={muted ? 0 : volume}
                 onChange={(e) => onVolumeChange(parseFloat(e.target.value))}
                 className="ml-1.5 w-16 cursor-pointer accent-kick"
-                aria-label="Volume"
+                aria-label={t("volume.label")}
               />
             </div>
           </div>
 
-          <a
-            href="https://github.com/EstebanDevJR/KickTok"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hidden rounded-full border border-white/10 bg-smoke/80 p-2 text-fog/80 backdrop-blur-md transition-colors hover:border-kick/40 hover:text-kick sm:block"
-            aria-label="Source code on GitHub"
-          >
-            <GithubIcon width={16} height={16} />
-          </a>
+          {!embedHref && (
+            <button
+              onClick={() => openSearch()}
+              className="hidden rounded-full border border-white/10 bg-smoke/80 p-2 text-fog/80 backdrop-blur-md transition-colors hover:border-kick/40 hover:text-kick md:block"
+              aria-label={t("search.open")}
+              title={t("search.open")}
+            >
+              <SearchIcon width={16} height={16} />
+            </button>
+          )}
         </div>
       </div>
     </header>
