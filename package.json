@@ -1,17 +1,20 @@
 {
-  "name": "kicktok",
-  "version": "0.1.0",
+  "name": "highkick",
+  "version": "2.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "node --disable-warning=ExperimentalWarning --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-transform-types --experimental-test-module-mocks --import ./scripts/test-setup.mjs --test --test-reporter=spec \"tests/*.test.ts\"",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
     "caniuse-lite": "^1.0.30001799",
-    "got-scraping": "^4.2.1",
     "hls.js": "^1.6.16",
+    "impit": "0.14.5",
     "next": "16.2.9",
     "react": "19.2.4",
     "react-dom": "19.2.4"
@@ -26,6 +29,9 @@
     "tailwindcss": "^4",
     "typescript": "^5"
   },
-  "description": "An open-source vertical clip feed for Kick.com",
-  "license": "MIT"
+  "description": "An open-source vertical clip feed for Kick.com: MIX recommendations, Following, Explore, search, live badges and embeds.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12"
+  }
 }

@@ -1,4 +1,5 @@
-import { getClips, type ClipsPage, type KickClip } from "@/lib/kick";
+import type { Clip, ClipsPage } from "@/lib/kick/types";
+import type { Pools } from "@/lib/pools";
 
 // The "MIX" feed. Kick's API only offers deterministic sorts, so refreshing
 // always returned the same clips in the same order. This builds a
@@ -7,16 +8,19 @@ import { getClips, type ClipsPage, type KickClip } from "@/lib/kick";
 // with a seeded RNG, and the deck is assembled by weighted round-robin
 // sampling across pools. A new seed on every page load means a new order,
 // while the same seed keeps pagination stable within one session.
+//
+// Everything in this module is pure (pools in, deck out) so it can be unit
+// tested and reasoned about without Kick.
 
-const PAGE_SIZE = 20;
+export const PAGE_SIZE = 20;
 
-interface Pool {
-  clips: KickClip[];
+interface WeightedPool {
+  clips: Clip[];
   weight: number;
 }
 
 // FNV-1a — turns the client's seed string into a uint32 for the RNG.
-function hashSeed(seed: string): number {
+export function hashSeed(seed: string): number {
   let h = 0x811c9dc5;
   for (let i = 0; i < seed.length; i++) {
     h ^= seed.charCodeAt(i);
@@ -26,7 +30,7 @@ function hashSeed(seed: string): number {
 }
 
 // mulberry32 — tiny deterministic PRNG, plenty for shuffling a feed.
-function mulberry32(state: number): () => number {
+export function mulberry32(state: number): () => number {
   return () => {
     state = (state + 0x6d2b79f5) | 0;
     let t = Math.imul(state ^ (state >>> 15), 1 | state);
@@ -35,7 +39,7 @@ function mulberry32(state: number): () => number {
   };
 }
 
-function shuffle<T>(items: T[], rand: () => number): T[] {
+export function shuffle<T>(items: T[], rand: () => number): T[] {
   const out = [...items];
   for (let i = out.length - 1; i > 0; i--) {
     const j = Math.floor(rand() * (i + 1));
@@ -44,49 +48,30 @@ function shuffle<T>(items: T[], rand: () => number): T[] {
   return out;
 }
 
-async function fetchPool(
-  sort: "view" | "date",
-  time: "day" | "week" | "month",
-): Promise<KickClip[]> {
-  try {
-    return (await getClips({ sort, time })).clips;
-  } catch {
-    // One pool failing shouldn't kill the whole feed.
-    return [];
-  }
-}
-
-async function buildDeck(seed: string): Promise<KickClip[]> {
-  const [day, week, month, fresh] = await Promise.all([
-    fetchPool("view", "day"),
-    fetchPool("view", "week"),
-    fetchPool("view", "month"),
-    fetchPool("date", "day"),
-  ]);
-
+export function buildDeck(pools: Pools, seed: string): Clip[] {
   const rand = mulberry32(hashSeed(seed));
 
   // Weights decide how often each pool gets the next slot: mostly what's hot
   // today, with steady doses of weekly/monthly hits and brand-new clips so
   // small streamers surface too.
-  const pools: Pool[] = [
-    { clips: shuffle(day, rand), weight: 0.4 },
-    { clips: shuffle(week, rand), weight: 0.25 },
-    { clips: shuffle(month, rand), weight: 0.15 },
-    { clips: shuffle(fresh, rand), weight: 0.2 },
+  const weighted: WeightedPool[] = [
+    { clips: shuffle(pools.day, rand), weight: 0.4 },
+    { clips: shuffle(pools.week, rand), weight: 0.25 },
+    { clips: shuffle(pools.month, rand), weight: 0.15 },
+    { clips: shuffle(pools.fresh, rand), weight: 0.2 },
   ];
 
   const seen = new Set<string>();
-  const deck: KickClip[] = [];
+  const deck: Clip[] = [];
 
-  while (pools.some((p) => p.clips.length > 0)) {
-    const total = pools.reduce(
+  while (weighted.some((p) => p.clips.length > 0)) {
+    const total = weighted.reduce(
       (sum, p) => sum + (p.clips.length > 0 ? p.weight : 0),
       0,
     );
     let pick = rand() * total;
-    let chosen: Pool | null = null;
-    for (const pool of pools) {
+    let chosen: WeightedPool | null = null;
+    for (const pool of weighted) {
       if (pool.clips.length === 0) continue;
       pick -= pool.weight;
       if (pick <= 0) {
@@ -94,7 +79,7 @@ async function buildDeck(seed: string): Promise<KickClip[]> {
         break;
       }
     }
-    chosen ??= pools.find((p) => p.clips.length > 0)!;
+    chosen ??= weighted.find((p) => p.clips.length > 0)!;
 
     const clip = chosen.clips.pop()!;
     if (!seen.has(clip.id)) {
@@ -110,11 +95,11 @@ async function buildDeck(seed: string): Promise<KickClip[]> {
 // categories keep their deck position but with a shrunken sort key, so they
 // surface earlier without displacing variety. Purely a function of the deck
 // and the favorites, so pagination stays deterministic within a session.
-function promoteFavorites(
-  deck: KickClip[],
+export function promoteFavorites(
+  deck: Clip[],
   favCategories: string[],
   favChannels: string[],
-): KickClip[] {
+): Clip[] {
   if (favCategories.length === 0 && favChannels.length === 0) return deck;
   const cats = new Set(favCategories);
   const chans = new Set(favChannels);
@@ -122,7 +107,7 @@ function promoteFavorites(
     .map((clip, i) => {
       const factor = chans.has(clip.channel.slug)
         ? 0.55
-        : cats.has(clip.category.slug)
+        : clip.category && cats.has(clip.category.slug)
           ? 0.7
           : 1;
       return { clip, score: i * factor };
@@ -131,17 +116,22 @@ function promoteFavorites(
     .map((entry) => entry.clip);
 }
 
-export async function getMixedFeed(
-  seed: string,
-  page: number,
-  favCategories: string[] = [],
-  favChannels: string[] = [],
-): Promise<ClipsPage> {
-  const deck = promoteFavorites(await buildDeck(seed), favCategories, favChannels);
+export function pageOfDeck(deck: Clip[], page: number): ClipsPage {
   const start = page * PAGE_SIZE;
   const clips = deck.slice(start, start + PAGE_SIZE);
   const hasMore = start + PAGE_SIZE < deck.length;
   return { clips, nextCursor: hasMore ? String(page + 1) : null };
+}
+
+export function mixedFeedPage(
+  pools: Pools,
+  seed: string,
+  page: number,
+  favCategories: string[] = [],
+  favChannels: string[] = [],
+): ClipsPage {
+  const deck = promoteFavorites(buildDeck(pools, seed), favCategories, favChannels);
+  return pageOfDeck(deck, page);
 }
 
 export function randomSeed(): string {

@@ -3,18 +3,30 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
 } from "react";
+import Link from "next/link";
 import { preconnect } from "react-dom";
-import type { ClipsPage, ClipTime, KickClip } from "@/lib/kick";
-import { getTopCategories, getTopChannels, recordAffinity } from "@/lib/affinity";
-import { isMatureHidden, setMatureHidden, subscribeSettings } from "@/lib/settings";
-import { getWatchedSet, markWatched } from "@/lib/watched";
+import type { Clip, ClipsPage, ClipTime } from "@/lib/kick/types";
+import { getTopCategories, getTopChannels } from "@/lib/affinity";
+import { isTypingTarget, sendClipCommand } from "@/lib/commands";
+import {
+  followsStore,
+  getWatchedSet,
+  hiddenStore,
+  isHiddenClip,
+  markWatched,
+  type Hidden,
+} from "@/lib/library";
+import { prefsStore, setPref } from "@/lib/prefs";
+import { toast } from "@/lib/toast";
 import ClipCard from "@/components/ClipCard";
 import TopBar, { type FeedMode } from "@/components/TopBar";
-import { KickBoltIcon } from "@/components/icons";
+import { useI18n } from "@/components/I18nProvider";
+import { ChevronLeftIcon, CompassIcon, KickBoltIcon, ShuffleIcon } from "@/components/icons";
 
 export interface FeedScope {
   channel?: string;
@@ -22,10 +34,25 @@ export interface FeedScope {
   label: string;
 }
 
+export type FeedSource =
+  | { kind: "home" }
+  | { kind: "scope"; scope: FeedScope }
+  | { kind: "static"; clips: Clip[] };
+
 interface FeedProps {
-  initial: ClipsPage | null;
-  initialSeed: string;
-  scope?: FeedScope;
+  source: FeedSource;
+  initial?: ClipsPage | null;
+  initialSeed?: string;
+  initialMode?: FeedMode;
+  initialTime?: ClipTime;
+  startIndex?: number;
+  variant?: "app" | "embed" | "overlay";
+  embedHref?: string;
+  // Rendered under the top bar, e.g. the channel profile strip.
+  header?: React.ReactNode;
+  // Shown once as a toast when the feed mounts.
+  notice?: string;
+  onClose?: () => void;
 }
 
 const MAX_RESHUFFLES = 5;
@@ -45,20 +72,22 @@ function pageUrl(
   time: ClipTime,
   seed: string,
   favs: Favorites,
+  followed: string[],
   scope?: FeedScope,
 ): string {
   if (mode === "mix") {
-    let url = `/api/feed?seed=${encodeURIComponent(seed)}&page=${encodeURIComponent(cursor)}`;
-    if (favs.categories.length > 0)
-      url += `&fc=${encodeURIComponent(favs.categories.join(","))}`;
-    if (favs.channels.length > 0)
-      url += `&fh=${encodeURIComponent(favs.channels.join(","))}`;
-    return url;
+    const qs = new URLSearchParams({ seed, page: cursor });
+    if (favs.categories.length > 0) qs.set("fc", favs.categories.join(","));
+    if (favs.channels.length > 0) qs.set("fh", favs.channels.join(","));
+    return `/api/feed?${qs}`;
   }
-  let url = `/api/clips?cursor=${encodeURIComponent(cursor)}&sort=${mode}&time=${time}`;
-  if (scope?.channel) url += `&channel=${encodeURIComponent(scope.channel)}`;
-  if (scope?.category) url += `&category=${encodeURIComponent(scope.category)}`;
-  return url;
+  if (mode === "following") {
+    return `/api/following?${new URLSearchParams({ ch: followed.join(","), page: cursor })}`;
+  }
+  const qs = new URLSearchParams({ cursor, sort: mode, time });
+  if (scope?.channel) qs.set("channel", scope.channel);
+  if (scope?.category) qs.set("category", scope.category);
+  return `/api/clips?${qs}`;
 }
 
 async function fetchPage(url: string): Promise<ClipsPage> {
@@ -67,194 +96,245 @@ async function fetchPage(url: string): Promise<ClipsPage> {
   return res.json();
 }
 
-function appendUnique(existing: KickClip[], incoming: KickClip[]): KickClip[] {
+function appendUnique(existing: Clip[], incoming: Clip[]): Clip[] {
   const seen = new Set(existing.map((c) => c.id));
   return [...existing, ...incoming.filter((c) => !seen.has(c.id))];
 }
 
-// 18+ clips are removed outright when the filter is on. Watched clips are
+function isFilteredOut(clip: Clip, hideMature: boolean, hidden: Hidden): boolean {
+  return (hideMature && clip.mature) || isHiddenClip(hidden, clip);
+}
+
+// 18+ and "not interested" clips are removed outright. Watched clips are
 // only dropped in MIX mode — unless that would empty the page, in which
 // case repeats beat a blank feed.
-function filterClips(
-  clips: KickClip[],
-  mode: FeedMode,
-  hideMature: boolean,
-): KickClip[] {
-  const pool = hideMature ? clips.filter((c) => !c.is_mature) : clips;
+function filterClips(clips: Clip[], mode: FeedMode, hideMature: boolean, hidden: Hidden): Clip[] {
+  const pool = clips.filter((c) => !isFilteredOut(c, hideMature, hidden));
   if (mode !== "mix") return pool;
   const watched = getWatchedSet();
   const unseen = pool.filter((c) => !watched.has(c.id));
   return unseen.length > 0 ? unseen : pool;
 }
 
-export default function Feed({ initial, initialSeed, scope }: FeedProps) {
+function prefersReducedMotion(): boolean {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+export default function Feed({
+  source,
+  initial = null,
+  initialSeed,
+  initialMode,
+  initialTime,
+  startIndex = 0,
+  variant = "app",
+  embedHref,
+  header,
+  notice,
+  onClose,
+}: FeedProps) {
+  const { t } = useI18n();
+  const scope = source.kind === "scope" ? source.scope : undefined;
+  const isStatic = source.kind === "static";
+  const isEmbed = variant === "embed";
+
   // Scoped feeds (one channel / one category) have no MIX deck; they start
   // on most-viewed of all time, which is the natural "best of" view.
-  const defaultMode: FeedMode = scope ? "view" : "mix";
-  const defaultTime: ClipTime = scope ? "all" : "day";
+  const defaultMode: FeedMode = initialMode ?? (source.kind === "home" ? "mix" : "view");
+  const defaultTime: ClipTime = initialTime ?? (scope ? "all" : "day");
+  const startClips = isStatic ? source.clips : (initial?.clips ?? []);
 
-  const [clips, setClips] = useState<KickClip[]>(initial?.clips ?? []);
+  const prefs = useSyncExternalStore(prefsStore.subscribe, prefsStore.get, prefsStore.serverSnapshot);
+  const hidden = useSyncExternalStore(hiddenStore.subscribe, hiddenStore.get, hiddenStore.serverSnapshot);
+  const follows = useSyncExternalStore(followsStore.subscribe, followsStore.get, followsStore.serverSnapshot);
+
+  const [clips, setClips] = useState<Clip[]>(startClips);
   const [mode, setMode] = useState<FeedMode>(defaultMode);
   const [time, setTime] = useState<ClipTime>(defaultTime);
+  // Browsers block unmuted autoplay until the first gesture, so every visit
+  // starts muted; a saved "sound on" preference is restored on first input.
   const [muted, setMuted] = useState(true);
-  const [volume, setVolume] = useState(0.8);
-  const [activeIndex, setActiveIndex] = useState(0);
-  const volumeRef = useRef(0.8);
-  const [loading, setLoading] = useState(!initial);
+  const [activeIndex, setActiveIndex] = useState(
+    Math.max(0, Math.min(startIndex, startClips.length - 1)),
+  );
+  const [loading, setLoading] = useState(!isStatic && !initial);
   const [error, setError] = useState<string | null>(null);
+  const [exhausted, setExhausted] = useState(
+    isStatic || (initial !== null && !initial.nextCursor && defaultMode !== "mix"),
+  );
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const clipsRef = useRef<KickClip[]>(initial?.clips ?? []);
-  const cursorRef = useRef<string | null>(initial?.nextCursor ?? null);
-  const seedRef = useRef(initialSeed);
+  const clipsRef = useRef<Clip[]>(startClips);
+  const cursorRef = useRef<string | null>(isStatic ? null : (initial?.nextCursor ?? null));
+  const seedRef = useRef(initialSeed ?? "");
   const reshufflesRef = useRef(0);
   const fetchingRef = useRef(false);
   const generationRef = useRef(0);
   const favsRef = useRef<Favorites>({ categories: [], channels: [] });
-  const hideMatureRef = useRef(false);
+  const followedRef = useRef<string[]>([]);
+  const filterRef = useRef({ hideMature: prefs.hideMature, hidden });
+  const volumeRef = useRef(prefs.volume);
 
-  const hideMature = useSyncExternalStore(
-    subscribeSettings,
-    isMatureHidden,
-    () => false,
-  );
+  const modes: FeedMode[] =
+    source.kind === "home"
+      ? ["mix", ...(follows.length > 0 || mode === "following" ? (["following"] as const) : []), "view", "date"]
+      : source.kind === "scope"
+        ? ["view", "date"]
+        : [];
 
   preconnect("https://clips.kick.com");
 
-  // Favorites are snapshotted alongside the seed: refreshing them only when
-  // the seed changes keeps /api/feed pagination deterministic in-session.
-  const refreshFavorites = useCallback(() => {
-    favsRef.current = {
-      categories: getTopCategories(4),
-      channels: getTopChannels(4),
-    };
-  }, []);
+  useEffect(() => {
+    filterRef.current = { hideMature: prefs.hideMature, hidden };
+    volumeRef.current = prefs.volume;
+  }, [prefs.hideMature, prefs.volume, hidden]);
 
   useEffect(() => {
-    refreshFavorites();
-  }, [refreshFavorites]);
+    if (prefs.muted) return;
+    const unmute = () => setMuted(false);
+    window.addEventListener("pointerdown", unmute, { once: true });
+    window.addEventListener("keydown", unmute, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", unmute);
+      window.removeEventListener("keydown", unmute);
+    };
+  }, [prefs.muted]);
 
-  const replaceClips = useCallback((next: KickClip[]) => {
+  useEffect(() => {
+    if (notice) toast(notice);
+  }, [notice]);
+
+  // Deep links into a list (the Library player) open on the chosen clip.
+  const startIndexRef = useRef(startIndex);
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (container && startIndexRef.current > 0) {
+      container.scrollTop = startIndexRef.current * container.clientHeight;
+    }
+  }, []);
+
+  // Favorites and follows are snapshotted alongside the seed: refreshing
+  // them only when the deck changes keeps pagination deterministic.
+  const snapshotPersonalization = useCallback(() => {
+    favsRef.current = { categories: getTopCategories(4), channels: getTopChannels(4) };
+    followedRef.current = followsStore.get().map((f) => f.slug);
+  }, []);
+
+  const replaceClips = useCallback((next: Clip[]) => {
     clipsRef.current = next;
     setClips(next);
   }, []);
 
-  const resetFeed = useCallback(
+  const loadFirstPage = useCallback(
     async (nextMode: FeedMode, nextTime: ClipTime) => {
       const generation = ++generationRef.current;
-      replaceClips([]);
-      setActiveIndex(0);
-      setError(null);
-      setLoading(true);
       cursorRef.current = null;
       reshufflesRef.current = 0;
-      if (nextMode === "mix") {
-        seedRef.current = newSeed();
-        refreshFavorites();
+      if (nextMode === "mix" && !seedRef.current) seedRef.current = newSeed();
+      snapshotPersonalization();
+
+      if (nextMode === "following" && followedRef.current.length === 0) {
+        setLoading(false);
+        setExhausted(true);
+        return;
       }
-      containerRef.current?.scrollTo({ top: 0 });
+
+      setError(null);
+      setLoading(true);
+      setExhausted(false);
       try {
         const page = await fetchPage(
-          pageUrl(nextMode, "0", nextTime, seedRef.current, favsRef.current, scope),
+          pageUrl(nextMode, "0", nextTime, seedRef.current, favsRef.current, followedRef.current, scope),
         );
         if (generation !== generationRef.current) return;
-        replaceClips(filterClips(page.clips, nextMode, hideMatureRef.current));
+        const { hideMature, hidden: hiddenNow } = filterRef.current;
+        replaceClips(filterClips(page.clips, nextMode, hideMature, hiddenNow));
         cursorRef.current = page.nextCursor;
+        if (!page.nextCursor && nextMode !== "mix") setExhausted(true);
       } catch {
         if (generation !== generationRef.current) return;
-        setError(
-          "Couldn't load clips from Kick. It may be rate-limiting — try again.",
-        );
+        setError(t("feed.error"));
       } finally {
         if (generation === generationRef.current) setLoading(false);
       }
     },
-    [replaceClips, refreshFavorites, scope],
+    [replaceClips, snapshotPersonalization, scope, t],
+  );
+
+  const resetFeed = useCallback(
+    (nextMode: FeedMode, nextTime: ClipTime) => {
+      replaceClips([]);
+      setActiveIndex(0);
+      if (nextMode === "mix") seedRef.current = newSeed();
+      containerRef.current?.scrollTo({ top: 0 });
+      void loadFirstPage(nextMode, nextTime);
+    },
+    [loadFirstPage, replaceClips],
   );
 
   const loadMore = useCallback(async () => {
     const cursor = cursorRef.current;
-    if (!cursor || fetchingRef.current) return;
+    if (!cursor || fetchingRef.current || isStatic) return;
     fetchingRef.current = true;
     const generation = generationRef.current;
     try {
       const page = await fetchPage(
-        pageUrl(mode, cursor, time, seedRef.current, favsRef.current, scope),
+        pageUrl(mode, cursor, time, seedRef.current, favsRef.current, followedRef.current, scope),
       );
       if (generation !== generationRef.current) return;
-      replaceClips(
-        appendUnique(
-          clipsRef.current,
-          filterClips(page.clips, mode, hideMatureRef.current),
-        ),
-      );
+      const { hideMature, hidden: hiddenNow } = filterRef.current;
+      replaceClips(appendUnique(clipsRef.current, filterClips(page.clips, mode, hideMature, hiddenNow)));
 
       if (page.nextCursor) {
         cursorRef.current = page.nextCursor;
-      } else if (
-        mode === "mix" &&
-        page.clips.length > 0 &&
-        reshufflesRef.current < MAX_RESHUFFLES
-      ) {
+      } else if (mode === "mix" && page.clips.length > 0 && reshufflesRef.current < MAX_RESHUFFLES) {
         // Deck exhausted: deal a fresh one. The seed changes so the order
         // differs, and dedupe + watch history drop anything already shown.
         reshufflesRef.current += 1;
         seedRef.current = newSeed();
-        refreshFavorites();
+        snapshotPersonalization();
         cursorRef.current = "0";
       } else {
         cursorRef.current = null;
+        setExhausted(true);
       }
     } catch {
       // transient — the next scroll near the end retries
     } finally {
       fetchingRef.current = false;
     }
-  }, [mode, time, scope, replaceClips, refreshFavorites]);
+  }, [mode, time, scope, isStatic, replaceClips, snapshotPersonalization]);
 
-  // Initial load when server-side prefetch failed. State already starts
-  // empty + loading, so only the fetch itself happens here.
+  // First load when the server couldn't prefetch (Kick hiccup, or a feed
+  // like Following that depends on what's in this browser). Mount-only:
+  // later mode/time changes go through resetFeed.
+  const mountRef = useRef({ isStatic, hasInitial: initial !== null, defaultMode, defaultTime });
   useEffect(() => {
-    if (initial) return;
-    const generation = generationRef.current;
-    (async () => {
-      try {
-        refreshFavorites();
-        const page = await fetchPage(
-          pageUrl(
-            defaultMode,
-            "0",
-            defaultTime,
-            seedRef.current,
-            favsRef.current,
-            scope,
-          ),
-        );
-        if (generation !== generationRef.current) return;
-        replaceClips(filterClips(page.clips, defaultMode, hideMatureRef.current));
-        cursorRef.current = page.nextCursor;
-      } catch {
-        if (generation !== generationRef.current) return;
-        setError(
-          "Couldn't load clips from Kick. It may be rate-limiting — try again.",
-        );
-      } finally {
-        if (generation === generationRef.current) setLoading(false);
-      }
-    })();
-  }, [initial, defaultMode, defaultTime, scope, replaceClips, refreshFavorites]);
-
-  // Flipping the 18+ filter on also scrubs clips that are already loaded;
-  // flipping it off only affects pages fetched from then on.
-  useEffect(() => {
-    hideMatureRef.current = hideMature;
-    if (!hideMature) return;
-    const filtered = clipsRef.current.filter((c) => !c.is_mature);
-    if (filtered.length !== clipsRef.current.length) {
-      replaceClips(filtered);
-      setActiveIndex((i) => Math.max(0, Math.min(i, filtered.length - 1)));
+    const { isStatic: staticList, hasInitial, defaultMode: m, defaultTime: tm } = mountRef.current;
+    if (staticList || hasInitial) {
+      snapshotPersonalization();
+      return;
     }
-  }, [hideMature, replaceClips]);
+    void loadFirstPage(m, tm);
+  }, [loadFirstPage, snapshotPersonalization]);
+
+  // Turning a filter on also scrubs clips that are already loaded; turning
+  // it off only affects pages fetched from then on.
+  const activeIndexRef = useRef(activeIndex);
+  useEffect(() => {
+    activeIndexRef.current = activeIndex;
+  }, [activeIndex]);
+
+  useEffect(() => {
+    const current = clipsRef.current;
+    const filtered = current.filter((c) => !isFilteredOut(c, prefs.hideMature, hidden));
+    if (filtered.length === current.length) return;
+    const index = activeIndexRef.current;
+    const activeId = current[index]?.id;
+    replaceClips(filtered);
+    const kept = filtered.findIndex((c) => c.id === activeId);
+    setActiveIndex(kept >= 0 ? kept : Math.max(0, Math.min(index, filtered.length - 1)));
+  }, [prefs.hideMature, hidden, replaceClips]);
 
   // Track which card owns the viewport.
   useEffect(() => {
@@ -271,159 +351,246 @@ export default function Feed({ initial, initialSeed, scope }: FeedProps) {
       },
       { root: container, threshold: 0.6 },
     );
-    container
-      .querySelectorAll("[data-index]")
-      .forEach((el) => observer.observe(el));
+    container.querySelectorAll("[data-index]").forEach((el) => observer.observe(el));
     return () => observer.disconnect();
   }, [clips.length]);
 
-  // Record history + taste signal, and pull the next page a few cards
-  // before the end.
+  // Record history and pull the next page a few cards before the end.
   useEffect(() => {
     const clip = clipsRef.current[activeIndex];
-    if (clip) {
-      markWatched(clip.id);
-      recordAffinity(clip, 1);
-    }
+    if (clip && !isEmbed) markWatched(clip);
     if (clips.length > 0 && activeIndex >= clips.length - 3) void loadMore();
-  }, [activeIndex, clips.length, loadMore]);
+  }, [activeIndex, clips.length, loadMore, isEmbed]);
 
   const scrollByCard = useCallback((dir: 1 | -1) => {
     const container = containerRef.current;
     if (!container) return;
     container.scrollBy({
       top: dir * container.clientHeight,
-      behavior: "smooth",
+      behavior: prefersReducedMotion() ? "auto" : "smooth",
     });
   }, []);
 
+  const autoplayNext = prefs.autoplayNext;
   const handleClipEnded = useCallback(
     (index: number): boolean => {
-      if (index >= clipsRef.current.length - 1) return false;
+      if (!autoplayNext || index >= clipsRef.current.length - 1) return false;
       scrollByCard(1);
       return true;
     },
-    [scrollByCard],
+    [autoplayNext, scrollByCard],
   );
 
   const handleVolumeChange = useCallback((v: number) => {
-    const next = Math.max(0, Math.min(1, Math.round(v * 10) / 10));
+    const next = Math.max(0, Math.min(1, Math.round(v * 20) / 20));
     volumeRef.current = next;
-    setVolume(next);
-    if (next > 0) setMuted(false);
-    else setMuted(true);
+    setPref("volume", next);
+    setPref("muted", next === 0);
+    setMuted(next === 0);
   }, []);
 
-  // Keyboard: arrows navigate, M mutes, [ ] adjust volume.
+  const toggleMute = useCallback(() => {
+    const next = !muted;
+    setMuted(next);
+    setPref("muted", next);
+  }, [muted]);
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      const container = containerRef.current;
-      if (!container) return;
-      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-        e.preventDefault();
-        scrollByCard(e.key === "ArrowDown" ? 1 : -1);
-      } else if (e.key.toLowerCase() === "m") {
-        setMuted((m) => !m);
-      } else if (e.key === "[") {
-        handleVolumeChange(volumeRef.current - 0.1);
-      } else if (e.key === "]") {
-        handleVolumeChange(volumeRef.current + 0.1);
+      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (isTypingTarget(e.target)) return;
+      if (document.querySelector("[role='dialog'][aria-modal='true']")) return;
+      const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      switch (key) {
+        case "ArrowDown":
+        case "j":
+          e.preventDefault();
+          scrollByCard(1);
+          break;
+        case "ArrowUp":
+        case "k":
+          e.preventDefault();
+          scrollByCard(-1);
+          break;
+        case " ":
+          e.preventDefault();
+          sendClipCommand({ type: "toggle-play" });
+          break;
+        case "ArrowLeft":
+        case "ArrowRight":
+          e.preventDefault();
+          sendClipCommand({ type: "seek", by: key === "ArrowLeft" ? -5 : 5 });
+          break;
+        case "l":
+          sendClipCommand({ type: "like" });
+          break;
+        case "s":
+          if (!isEmbed) sendClipCommand({ type: "share" });
+          break;
+        case "m":
+          toggleMute();
+          break;
+        case "[":
+          handleVolumeChange(volumeRef.current - 0.1);
+          break;
+        case "]":
+          handleVolumeChange(volumeRef.current + 0.1);
+          break;
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleVolumeChange, scrollByCard]);
+  }, [handleVolumeChange, scrollByCard, toggleMute, isEmbed]);
 
   function handleModeChange(next: FeedMode) {
     // Re-tapping MIX deals a new shuffle on purpose.
     if (next === mode && next !== "mix") return;
     setMode(next);
-    void resetFeed(next, time);
+    resetFeed(next, time);
   }
 
   function handleTimeChange(next: ClipTime) {
     if (next === time) return;
     setTime(next);
-    void resetFeed(mode, next);
+    resetFeed(mode, next);
   }
 
+  const rootClass =
+    variant === "overlay"
+      ? "fixed inset-0 z-[60] h-dvh bg-ink"
+      : variant === "embed"
+        ? "relative h-dvh bg-ink"
+        : "relative h-[calc(100dvh-var(--nav-h))] bg-ink";
+
+  const followingEmpty = mode === "following" && !loading && clips.length === 0 && follows.length === 0;
+  const showEnd = exhausted && !loading && clips.length > 0 && !isStatic;
+
   return (
-    <main className="relative h-dvh bg-ink">
+    <main className={rootClass}>
       <TopBar
         mode={mode}
+        modes={modes}
         time={time}
         muted={muted}
-        volume={volume}
-        hideMature={hideMature}
+        volume={prefs.volume}
+        hideMature={prefs.hideMature}
         scopeLabel={scope?.label}
+        embedHref={embedHref}
         onModeChange={handleModeChange}
         onTimeChange={handleTimeChange}
-        onToggleMute={() => setMuted((m) => !m)}
+        onToggleMute={toggleMute}
         onVolumeChange={handleVolumeChange}
-        onToggleMature={() => setMatureHidden(!hideMature)}
+        onToggleMature={() => setPref("hideMature", !prefs.hideMature)}
       />
 
-      <div
-        ref={containerRef}
-        className="no-scrollbar h-dvh snap-y snap-mandatory overflow-y-scroll"
-      >
+      {onClose && (
+        <button
+          onClick={onClose}
+          className="absolute left-3 top-3 z-50 flex items-center gap-1 rounded-full border border-white/10 bg-smoke/90 py-1.5 pl-2 pr-3 font-mono text-xs font-semibold text-fog backdrop-blur-md transition-colors hover:border-kick/40 hover:text-kick"
+        >
+          <ChevronLeftIcon width={16} height={16} />
+          {t("nav.back")}
+        </button>
+      )}
+
+      {header && <div className="pointer-events-none absolute inset-x-0 top-14 z-30">{header}</div>}
+
+      <div ref={containerRef} className="no-scrollbar h-full snap-y snap-mandatory overflow-y-scroll">
         {clips.map((clip, i) => (
           <ClipCard
             key={clip.id}
             clip={clip}
             index={i}
             active={i === activeIndex}
-            preload={Math.abs(i - activeIndex) === 1}
+            preload={!prefs.dataSaver && Math.abs(i - activeIndex) === 1}
             muted={muted}
-            volume={volume}
-            onToggleMute={() => setMuted((m) => !m)}
+            volume={prefs.volume}
+            dataSaver={prefs.dataSaver}
+            embed={isEmbed}
+            onToggleMute={toggleMute}
             onVolumeChange={handleVolumeChange}
             onEnded={() => handleClipEnded(i)}
           />
         ))}
 
+        {showEnd && (
+          <section className="flex h-full snap-start flex-col items-center justify-center gap-5 px-8 text-center">
+            <KickBoltIcon width={42} height={42} className="text-glow text-kick" />
+            <p className="font-display text-xl font-extrabold text-fog">{t("feed.end")}</p>
+            <div className="flex flex-wrap justify-center gap-3">
+              {source.kind === "home" && (
+                <button
+                  onClick={() => handleModeChange("mix")}
+                  className="flex items-center gap-2 border border-kick bg-kick/10 px-4 py-2 font-mono text-xs font-semibold uppercase tracking-widest text-kick transition-colors hover:bg-kick hover:text-ink"
+                >
+                  <ShuffleIcon width={14} height={14} />
+                  {t("mode.mix")}
+                </button>
+              )}
+              {!isEmbed && (
+                <Link
+                  href="/explore"
+                  className="flex items-center gap-2 border border-white/15 px-4 py-2 font-mono text-xs font-semibold uppercase tracking-widest text-fog/80 transition-colors hover:border-kick hover:text-kick"
+                >
+                  <CompassIcon width={14} height={14} />
+                  {t("nav.explore")}
+                </Link>
+              )}
+            </div>
+          </section>
+        )}
+
         {loading && clips.length === 0 && (
-          <div className="flex h-dvh flex-col items-center justify-center gap-4">
-            <KickBoltIcon
-              width={42}
-              height={42}
-              className="text-glow animate-pulse text-kick"
-            />
-            <p className="font-mono text-xs uppercase tracking-[0.3em] text-fog/50">
-              loading clips
-            </p>
+          <div className="flex h-full flex-col items-center justify-center gap-4">
+            <KickBoltIcon width={42} height={42} className="text-glow animate-pulse text-kick" />
+            <p className="font-mono text-xs uppercase tracking-[0.3em] text-fog/50">{t("feed.loading")}</p>
           </div>
         )}
 
-        {!loading && !error && clips.length === 0 && (
-          <div className="flex h-dvh flex-col items-center justify-center gap-4 px-8 text-center">
+        {followingEmpty && (
+          <div className="flex h-full flex-col items-center justify-center gap-5 px-8 text-center">
+            <KickBoltIcon width={42} height={42} className="text-fog/20" />
+            <p className="max-w-sm text-sm text-fog/70">{t("feed.followingEmpty")}</p>
+            <Link
+              href="/explore"
+              className="border border-kick bg-kick/10 px-5 py-2 font-mono text-xs font-semibold uppercase tracking-widest text-kick transition-colors hover:bg-kick hover:text-ink"
+            >
+              {t("feed.followingCta")}
+            </Link>
+          </div>
+        )}
+
+        {!loading && !error && !followingEmpty && clips.length === 0 && (
+          <div className="flex h-full flex-col items-center justify-center gap-4 px-8 text-center">
             <KickBoltIcon width={42} height={42} className="text-fog/20" />
             <p className="max-w-sm text-sm text-fog/70">
-              No clips here{scope ? ` for ${scope.label}` : ""} yet.
+              {scope ? t("feed.emptyScoped", { label: scope.label }) : t("feed.empty")}
             </p>
           </div>
         )}
 
         {error && clips.length === 0 && (
-          <div className="flex h-dvh flex-col items-center justify-center gap-5 px-8 text-center">
+          <div className="flex h-full flex-col items-center justify-center gap-5 px-8 text-center">
             <KickBoltIcon width={42} height={42} className="text-fog/20" />
             <p className="max-w-sm text-sm text-fog/70">{error}</p>
             <button
-              onClick={() => void resetFeed(mode, time)}
+              onClick={() => resetFeed(mode, time)}
               className="border border-kick bg-kick/10 px-5 py-2 font-mono text-xs font-semibold uppercase tracking-widest text-kick transition-colors hover:bg-kick hover:text-ink"
             >
-              Retry
+              {t("feed.retry")}
             </button>
           </div>
         )}
       </div>
 
-      <p
-        data-ui="kbd-hint"
-        className="pointer-events-none fixed bottom-2 left-1/2 z-30 hidden -translate-x-1/2 whitespace-nowrap font-mono text-[10px] uppercase tracking-[0.25em] text-fog/30 sm:block"
-      >
-        ↑↓ scroll · click pause · double-click like · drag bar seek · M mute · [ ] volume
-      </p>
+      {!isEmbed && (
+        <p
+          data-ui="kbd-hint"
+          className="pointer-events-none absolute bottom-2 left-1/2 z-30 hidden -translate-x-1/2 whitespace-nowrap font-mono text-[10px] uppercase tracking-[0.25em] text-fog/30 lg:block"
+        >
+          {t("feed.kbdHint")}
+        </p>
+      )}
     </main>
   );
 }

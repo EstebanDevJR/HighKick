@@ -1,33 +1,22 @@
-import { NextRequest, NextResponse } from "next/server";
-import { getMixedFeed } from "@/lib/recommend";
-import { SLUG_RE } from "@/lib/kick";
+import { NextResponse, type NextRequest } from "next/server";
+import { badRequest, parsePage, parseSlugs, rateLimited, upstreamFailure } from "@/lib/api";
+import { getMixedFeed } from "@/lib/feeds";
 
 export const dynamic = "force-dynamic";
 
-// Favorite slugs arrive as CSV; anything malformed is dropped rather than
-// rejected so a corrupt localStorage profile can't break the feed.
-function parseSlugs(csv: string | null): string[] {
-  if (!csv) return [];
-  return csv
-    .split(",")
-    .filter((s) => SLUG_RE.test(s))
-    .slice(0, 5);
-}
-
 export async function GET(req: NextRequest) {
+  const limited = rateLimited(req);
+  if (limited) return limited;
+
   const params = req.nextUrl.searchParams;
   const seed = params.get("seed") ?? "";
-  const page = Number(params.get("page") ?? "0");
+  const page = parsePage(params.get("page"));
 
-  if (!/^[a-z0-9-]{1,32}$/i.test(seed)) {
-    return NextResponse.json({ error: "Invalid seed" }, { status: 400 });
-  }
-  if (!Number.isInteger(page) || page < 0 || page > 50) {
-    return NextResponse.json({ error: "Invalid page" }, { status: 400 });
-  }
+  if (!/^[a-z0-9-]{1,32}$/i.test(seed)) return badRequest("Invalid seed");
+  if (page === null) return badRequest("Invalid page");
 
-  const favCategories = parseSlugs(params.get("fc"));
-  const favChannels = parseSlugs(params.get("fh"));
+  const favCategories = parseSlugs(params.get("fc"), 5);
+  const favChannels = parseSlugs(params.get("fh"), 5);
 
   try {
     const feed = await getMixedFeed(seed, page, favCategories, favChannels);
@@ -35,10 +24,6 @@ export async function GET(req: NextRequest) {
       headers: { "Cache-Control": "no-store" },
     });
   } catch (err) {
-    console.error("[api/feed]", err);
-    return NextResponse.json(
-      { error: "Failed to reach Kick. Try again in a moment." },
-      { status: 502 },
-    );
+    return upstreamFailure("feed", err);
   }
 }

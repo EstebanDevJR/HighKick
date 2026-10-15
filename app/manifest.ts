@@ -2,8 +2,8 @@ import type { MetadataRoute } from "next";
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "KickTok",
-    short_name: "KickTok",
+    name: "HighKick",
+    short_name: "HighKick",
     description: "An open-source vertical clip feed for Kick.com",
     start_url: "/",
     display: "standalone",

@@ -1,29 +1,47 @@
-const compact = new Intl.NumberFormat("en", {
-  notation: "compact",
-  maximumFractionDigits: 1,
-});
+import type { Locale } from "@/lib/i18n/config";
 
-export function formatCount(n: number): string {
-  return compact.format(n);
+const compactCache = new Map<string, Intl.NumberFormat>();
+const relativeCache = new Map<string, Intl.RelativeTimeFormat>();
+
+export function formatCount(n: number, locale: Locale = "en"): string {
+  let fmt = compactCache.get(locale);
+  if (!fmt) {
+    fmt = new Intl.NumberFormat(locale, { notation: "compact", maximumFractionDigits: 1 });
+    compactCache.set(locale, fmt);
+  }
+  return fmt.format(n);
 }
 
 export function formatDuration(totalSeconds: number): string {
-  const s = Math.round(totalSeconds);
+  const s = Math.max(0, Math.round(totalSeconds));
   const m = Math.floor(s / 60);
   const r = s % 60;
   return `${m}:${String(r).padStart(2, "0")}`;
 }
 
-export function timeAgo(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime();
-  const mins = Math.floor(diff / 60_000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  const months = Math.floor(days / 30);
-  if (months < 12) return `${months}mo ago`;
-  return `${Math.floor(months / 12)}y ago`;
+const UNITS: [Intl.RelativeTimeFormatUnit, number][] = [
+  ["year", 365 * 24 * 60],
+  ["month", 30 * 24 * 60],
+  ["day", 24 * 60],
+  ["hour", 60],
+  ["minute", 1],
+];
+
+export function timeAgo(
+  iso: string,
+  locale: Locale = "en",
+  justNow = "just now",
+  now = Date.now(),
+): string {
+  const mins = Math.floor((now - new Date(iso).getTime()) / 60_000);
+  if (!Number.isFinite(mins) || mins < 1) return justNow;
+  let fmt = relativeCache.get(locale);
+  if (!fmt) {
+    fmt = new Intl.RelativeTimeFormat(locale, { numeric: "always", style: "narrow" });
+    relativeCache.set(locale, fmt);
+  }
+  for (const [unit, size] of UNITS) {
+    if (mins >= size) return fmt.format(-Math.floor(mins / size), unit);
+  }
+  return justNow;
 }
