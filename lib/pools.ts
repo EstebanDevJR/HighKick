@@ -1,4 +1,4 @@
-import { getClips } from "@/lib/kick";
+import { getClips, type ClipScope } from "@/lib/kick";
 import type { Clip, ClipSort, ClipTime } from "@/lib/kick/types";
 
 // The four global clip pools that both the MIX deck and the Explore page are
@@ -16,12 +16,13 @@ async function fetchPool(
   sort: ClipSort,
   time: ClipTime,
   pages: number,
+  scope: ClipScope = {},
 ): Promise<Clip[]> {
   const out: Clip[] = [];
   let cursor = "0";
   for (let i = 0; i < pages; i++) {
     try {
-      const page = await getClips({ sort, time, cursor });
+      const page = await getClips({ ...scope, sort, time, cursor });
       out.push(...page.clips);
       if (!page.nextCursor) break;
       cursor = page.nextCursor;
@@ -58,4 +59,16 @@ export function allPoolClips(pools: Pools): Clip[] {
     }
   }
   return out;
+}
+
+// The clips a scoped MIX (one channel or one category) shuffles: the
+// scope's all-time best plus its newest, so random mode reaches beyond the
+// first page of either listing.
+export async function getScopePool(scope: ClipScope): Promise<Clip[]> {
+  const [top, recent] = await Promise.all([
+    fetchPool("view", "all", 3, scope),
+    fetchPool("date", "all", 2, scope),
+  ]);
+  if (top.length + recent.length === 0) throw new Error("Kick returned no clips");
+  return [...top, ...recent];
 }

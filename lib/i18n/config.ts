@@ -15,22 +15,8 @@ export function isLocale(v: unknown): v is Locale {
   return typeof v === "string" && (LOCALES as readonly string[]).includes(v);
 }
 
-// Picks the best supported locale from an Accept-Language header, honouring
-// q-values ("es-MX,es;q=0.9,en;q=0.8" → "es").
-export function matchLocale(acceptLanguage: string | null | undefined): Locale {
-  if (!acceptLanguage) return DEFAULT_LOCALE;
-  const ranked = acceptLanguage
-    .split(",")
-    .map((part) => {
-      const [tag, ...params] = part.trim().split(";");
-      const q = params.find((p) => p.trim().startsWith("q="));
-      const quality = q ? Number(q.trim().slice(2)) : 1;
-      return { lang: tag.trim().toLowerCase().split("-")[0], quality: Number.isFinite(quality) ? quality : 0 };
-    })
-    .filter((x) => x.lang && x.quality > 0)
-    .sort((a, b) => b.quality - a.quality);
-  for (const { lang } of ranked) {
-    if (isLocale(lang)) return lang;
-  }
-  return DEFAULT_LOCALE;
+// English unless the visitor picked a language in Settings: the browser's
+// Accept-Language is deliberately ignored so every first visit is in English.
+export function resolveLocale(chosen: unknown): Locale {
+  return isLocale(chosen) ? chosen : DEFAULT_LOCALE;
 }

@@ -1,16 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { LOCALES, matchLocale } from "@/lib/i18n/config";
+import { LOCALES, resolveLocale } from "@/lib/i18n/config";
 import { messages, translator, type MessageKey } from "@/lib/i18n/messages";
 import { formatDuration, timeAgo } from "@/lib/format";
 
-test("Accept-Language negotiation honours q-values and region tags", () => {
-  assert.equal(matchLocale("es-MX,es;q=0.9,en;q=0.8"), "es");
-  assert.equal(matchLocale("fr-FR,pt-BR;q=0.8,en;q=0.5"), "pt");
-  assert.equal(matchLocale("en;q=0.2,es;q=0.9"), "es");
-  assert.equal(matchLocale("de,fr"), "en");
-  assert.equal(matchLocale(null), "en");
-  assert.equal(matchLocale("es;q=0"), "en");
+test("English is the default unless a supported locale was chosen", () => {
+  assert.equal(resolveLocale(undefined), "en");
+  assert.equal(resolveLocale("es"), "es");
+  assert.equal(resolveLocale("pt"), "pt");
+  assert.equal(resolveLocale("fr"), "en");
+  assert.equal(resolveLocale(""), "en");
 });
 
 test("every locale defines the same placeholders as English", () => {

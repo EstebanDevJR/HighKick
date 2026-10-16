@@ -80,7 +80,10 @@ export default function SearchPanel({
     };
   }, [trimmed, initialResults?.query]);
 
-  const shown = trimmed.length >= 2 && results.query === trimmed ? results : EMPTY;
+  // The last answer stays on screen while the next one loads. Blanking it on
+  // every keystroke made the list vanish under a finger on phones, where the
+  // keyboard can still rewrite the query as the input loses focus.
+  const shown = trimmed.length >= 2 ? results : EMPTY;
   const handle = trimmed.replace(/^@/, "").replace(/\s+/g, "").toLowerCase();
   const handleIsSlug = SLUG_RE.test(handle);
 
@@ -92,9 +95,15 @@ export default function SearchPanel({
     return list;
   }, [shown]);
 
-  function go(href: string) {
+  // Result rows are plain links that navigate on their own; only keyboard
+  // picks need the router.
+  function picked() {
     rememberQuery(trimmed);
     onNavigate?.();
+  }
+
+  function go(href: string) {
+    picked();
     router.push(href);
   }
 
@@ -135,6 +144,9 @@ export default function SearchPanel({
           aria-label={t("nav.search")}
           maxLength={64}
           autoComplete="off"
+          autoCapitalize="none"
+          autoCorrect="off"
+          enterKeyHint="search"
           spellCheck={false}
           className="min-w-0 flex-1 bg-transparent text-base text-fog outline-none placeholder:text-fog/35 focus-visible:outline-none [&::-webkit-search-cancel-button]:hidden"
         />
@@ -197,10 +209,7 @@ export default function SearchPanel({
               <li key={c.slug}>
                 <Link
                   href={`/c/${c.slug}`}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    go(`/c/${c.slug}`);
-                  }}
+                  onClick={picked}
                   className={itemClass(`ch:${c.slug}`)}
                 >
                   <span
@@ -249,10 +258,7 @@ export default function SearchPanel({
               <li key={c.slug}>
                 <Link
                   href={`/g/${c.slug}`}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    go(`/g/${c.slug}`);
-                  }}
+                  onClick={picked}
                   className={itemClass(`cat:${c.slug}`)}
                 >
                   <span className="h-12 w-9 shrink-0 overflow-hidden rounded bg-ink ring-1 ring-white/10">
@@ -286,10 +292,7 @@ export default function SearchPanel({
               <li key={c.id}>
                 <Link
                   href={clipPath(c)}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    go(clipPath(c));
-                  }}
+                  onClick={picked}
                   className={itemClass(`clip:${c.id}`)}
                 >
                   <span className="h-10 w-16 shrink-0 overflow-hidden rounded bg-ink ring-1 ring-white/10">

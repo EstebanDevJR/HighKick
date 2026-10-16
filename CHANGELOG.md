@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Dead clips are skipped.** Kick still lists clips whose video is gone from its CDN (mostly old ones), which used to spin forever. Upcoming clips are probed and anything the CDN rejects is dropped from every feed and remembered locally; network hiccups never hide a clip.
+- **MIX on channel and category pages:** a shuffled, seed-stable deck of that streamer's (or category's) clips next to TOP and NEW.
+- English is now the default language for everyone; Spanish and Portuguese are picked in Settings (the browser's `Accept-Language` is no longer used).
+- Phones: the time-range chip no longer covers the MIX / TOP / NEW selector — the logo shrinks to the bolt instead.
+- Explore: the trending streamers row gets scroll arrows on desktop, where a mouse wheel couldn't move it sideways.
+- Search: results stay on screen while the next query loads and the keyboard can't autocorrect the query, so tapping a streamer on a phone reliably opens them.
+
 ## 2.0.0
 
 ### Kick client and data layer

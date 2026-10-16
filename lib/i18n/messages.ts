@@ -99,6 +99,8 @@ const en = {
   "explore.liveFollowing": "Live now from channels you follow",
   "explore.unavailable": "Kick isn't answering right now — some sections may be missing.",
   "explore.views": "{n} views",
+  "explore.scrollLeft": "Scroll left",
+  "explore.scrollRight": "Scroll right",
 
   "search.placeholder": "Search streamers, categories, clips…",
   "search.channels": "Channels",
@@ -281,6 +283,8 @@ const es: Messages = {
   "explore.liveFollowing": "En vivo ahora de los canales que sigues",
   "explore.unavailable": "Kick no está respondiendo ahora — puede que falten secciones.",
   "explore.views": "{n} vistas",
+  "explore.scrollLeft": "Desplazar a la izquierda",
+  "explore.scrollRight": "Desplazar a la derecha",
 
   "search.placeholder": "Busca streamers, categorías, clips…",
   "search.channels": "Canales",
@@ -460,6 +464,8 @@ const pt: Messages = {
   "explore.liveFollowing": "Ao vivo agora nos canais que você segue",
   "explore.unavailable": "A Kick não está respondendo agora — algumas seções podem faltar.",
   "explore.views": "{n} visualizações",
+  "explore.scrollLeft": "Rolar para a esquerda",
+  "explore.scrollRight": "Rolar para a direita",
 
   "search.placeholder": "Busque streamers, categorias, clipes…",
   "search.channels": "Canais",

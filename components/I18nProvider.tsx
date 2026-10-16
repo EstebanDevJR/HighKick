@@ -14,7 +14,7 @@ const I18nContext = createContext<I18nValue>({
   t: translator("en"),
 });
 
-// The locale is resolved on the server (cookie, then Accept-Language) and
+// The locale is resolved on the server (the Settings cookie, else English) and
 // handed down here, so server and client render the same strings.
 export function I18nProvider({
   locale,

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import ClipTile from "@/components/ClipTile";
+import HScroll from "@/components/HScroll";
 import LiveFollowing from "@/components/LiveFollowing";
 import PageShell, { SectionTitle } from "@/components/PageShell";
 import { SearchIcon } from "@/components/icons";
@@ -42,7 +43,7 @@ export default async function ExplorePage() {
       {data.trendingChannels.length > 0 && (
         <section className="mb-10">
           <SectionTitle>{t("explore.trendingChannels")}</SectionTitle>
-          <ul className="no-scrollbar -mx-4 flex gap-3 overflow-x-auto px-4 pb-1">
+          <HScroll className="-mx-4 flex gap-3 px-4 pb-1 pt-1">
             {data.trendingChannels.map((c, i) => (
               <li key={c.slug} className="w-28 shrink-0">
                 <Link href={`/c/${c.slug}`} className="group flex flex-col items-center gap-2 text-center">
@@ -68,7 +69,7 @@ export default async function ExplorePage() {
                 </Link>
               </li>
             ))}
-          </ul>
+          </HScroll>
         </section>
       )}
 

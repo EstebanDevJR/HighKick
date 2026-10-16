@@ -21,6 +21,7 @@ import {
   markWatched,
   type Hidden,
 } from "@/lib/library";
+import { isUnplayable, markUnplayable, probeClip } from "@/lib/playable";
 import { prefsStore, setPref } from "@/lib/prefs";
 import { toast } from "@/lib/toast";
 import ClipCard from "@/components/ClipCard";
@@ -56,6 +57,9 @@ interface FeedProps {
 }
 
 const MAX_RESHUFFLES = 5;
+// How many clips from the current one onwards get their video probed, so a
+// dead clip is usually gone before the viewer reaches it.
+const PROBE_AHEAD = 4;
 
 function newSeed(): string {
   return Math.random().toString(36).slice(2, 10);
@@ -75,6 +79,12 @@ function pageUrl(
   followed: string[],
   scope?: FeedScope,
 ): string {
+  if (mode === "mix" && scope) {
+    const qs = new URLSearchParams({ seed, page: cursor });
+    if (scope.channel) qs.set("channel", scope.channel);
+    if (scope.category) qs.set("category", scope.category);
+    return `/api/feed?${qs}`;
+  }
   if (mode === "mix") {
     const qs = new URLSearchParams({ seed, page: cursor });
     if (favs.categories.length > 0) qs.set("fc", favs.categories.join(","));
@@ -102,15 +112,21 @@ function appendUnique(existing: Clip[], incoming: Clip[]): Clip[] {
 }
 
 function isFilteredOut(clip: Clip, hideMature: boolean, hidden: Hidden): boolean {
-  return (hideMature && clip.mature) || isHiddenClip(hidden, clip);
+  return (hideMature && clip.mature) || isHiddenClip(hidden, clip) || isUnplayable(clip.id);
 }
 
-// 18+ and "not interested" clips are removed outright. Watched clips are
-// only dropped in MIX mode — unless that would empty the page, in which
-// case repeats beat a blank feed.
-function filterClips(clips: Clip[], mode: FeedMode, hideMature: boolean, hidden: Hidden): Clip[] {
+// 18+, "not interested" and known-dead clips are removed outright. Watched
+// clips are only dropped in the home MIX — unless that would empty the page,
+// in which case repeats beat a blank feed. A channel's own MIX keeps them:
+// there it's the shuffle people asked for, not discovery.
+function filterClips(
+  clips: Clip[],
+  dropWatched: boolean,
+  hideMature: boolean,
+  hidden: Hidden,
+): Clip[] {
   const pool = clips.filter((c) => !isFilteredOut(c, hideMature, hidden));
-  if (mode !== "mix") return pool;
+  if (!dropWatched) return pool;
   const watched = getWatchedSet();
   const unseen = pool.filter((c) => !watched.has(c.id));
   return unseen.length > 0 ? unseen : pool;
@@ -138,8 +154,8 @@ export default function Feed({
   const isStatic = source.kind === "static";
   const isEmbed = variant === "embed";
 
-  // Scoped feeds (one channel / one category) have no MIX deck; they start
-  // on most-viewed of all time, which is the natural "best of" view.
+  // Scoped feeds (one channel / one category) start on most-viewed of all
+  // time, the natural "best of" view; their MIX shuffles just that scope.
   const defaultMode: FeedMode = initialMode ?? (source.kind === "home" ? "mix" : "view");
   const defaultTime: ClipTime = initialTime ?? (scope ? "all" : "day");
   const startClips = isStatic ? source.clips : (initial?.clips ?? []);
@@ -179,7 +195,7 @@ export default function Feed({
     source.kind === "home"
       ? ["mix", ...(follows.length > 0 || mode === "following" ? (["following"] as const) : []), "view", "date"]
       : source.kind === "scope"
-        ? ["view", "date"]
+        ? ["mix", "view", "date"]
         : [];
 
   preconnect("https://clips.kick.com");
@@ -248,9 +264,10 @@ export default function Feed({
         );
         if (generation !== generationRef.current) return;
         const { hideMature, hidden: hiddenNow } = filterRef.current;
-        replaceClips(filterClips(page.clips, nextMode, hideMature, hiddenNow));
+        replaceClips(filterClips(page.clips, nextMode === "mix" && !scope, hideMature, hiddenNow));
         cursorRef.current = page.nextCursor;
-        if (!page.nextCursor && nextMode !== "mix") setExhausted(true);
+        // Only the home MIX deals a fresh deck when one runs out.
+        if (!page.nextCursor && (nextMode !== "mix" || scope)) setExhausted(true);
       } catch {
         if (generation !== generationRef.current) return;
         setError(t("feed.error"));
@@ -283,11 +300,17 @@ export default function Feed({
       );
       if (generation !== generationRef.current) return;
       const { hideMature, hidden: hiddenNow } = filterRef.current;
-      replaceClips(appendUnique(clipsRef.current, filterClips(page.clips, mode, hideMature, hiddenNow)));
+      const fresh = filterClips(page.clips, mode === "mix" && !scope, hideMature, hiddenNow);
+      replaceClips(appendUnique(clipsRef.current, fresh));
 
       if (page.nextCursor) {
         cursorRef.current = page.nextCursor;
-      } else if (mode === "mix" && page.clips.length > 0 && reshufflesRef.current < MAX_RESHUFFLES) {
+      } else if (
+        mode === "mix" &&
+        !scope &&
+        page.clips.length > 0 &&
+        reshufflesRef.current < MAX_RESHUFFLES
+      ) {
         // Deck exhausted: deal a fresh one. The seed changes so the order
         // differs, and dedupe + watch history drop anything already shown.
         reshufflesRef.current += 1;
@@ -335,6 +358,29 @@ export default function Feed({
     const kept = filtered.findIndex((c) => c.id === activeId);
     setActiveIndex(kept >= 0 ? kept : Math.max(0, Math.min(index, filtered.length - 1)));
   }, [prefs.hideMature, hidden, replaceClips]);
+
+  // Dead clips ahead of the viewer are dropped; ones already scrolled past
+  // stay, since removing them would yank the feed out from under the user.
+  const dropUnplayable = useCallback(
+    (id: string) => {
+      markUnplayable(id);
+      const current = clipsRef.current;
+      const index = current.findIndex((c) => c.id === id);
+      if (index < 0 || index < activeIndexRef.current) return;
+      const next = current.filter((c) => c.id !== id);
+      replaceClips(next);
+      setActiveIndex((i) => Math.max(0, Math.min(i, next.length - 1)));
+    },
+    [replaceClips],
+  );
+
+  useEffect(() => {
+    for (const clip of clips.slice(activeIndex, activeIndex + PROBE_AHEAD)) {
+      void probeClip(clip).then((ok) => {
+        if (!ok) dropUnplayable(clip.id);
+      });
+    }
+  }, [clips, activeIndex, dropUnplayable]);
 
   // Track which card owns the viewport.
   useEffect(() => {
@@ -510,6 +556,7 @@ export default function Feed({
             onToggleMute={toggleMute}
             onVolumeChange={handleVolumeChange}
             onEnded={() => handleClipEnded(i)}
+            onUnplayable={() => dropUnplayable(clip.id)}
           />
         ))}
 
@@ -518,7 +565,7 @@ export default function Feed({
             <KickBoltIcon width={42} height={42} className="text-glow text-kick" />
             <p className="font-display text-xl font-extrabold text-fog">{t("feed.end")}</p>
             <div className="flex flex-wrap justify-center gap-3">
-              {source.kind === "home" && (
+              {modes.includes("mix") && (
                 <button
                   onClick={() => handleModeChange("mix")}
                   className="flex items-center gap-2 border border-kick bg-kick/10 px-4 py-2 font-mono text-xs font-semibold uppercase tracking-widest text-kick transition-colors hover:bg-kick hover:text-ink"

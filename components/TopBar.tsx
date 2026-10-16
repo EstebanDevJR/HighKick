@@ -80,13 +80,22 @@ export default function TopBar({
     onTimeChange(TIME_OPTIONS[(idx + 1) % TIME_OPTIONS.length].value);
   }
 
+  // Phones can't fit the full wordmark next to the mode tabs and the time
+  // chip, so it shrinks to the bolt whenever the chip is shown.
+  const compactLogo = showTime && tabs.length > 1;
   const logo = (
     <>
       <span className="flex items-center gap-1 bg-kick px-2 py-1 font-display text-lg font-extrabold leading-none text-ink">
-        <KickBoltIcon width={14} height={14} />
-        HIGH
+        <KickBoltIcon width={14} height={14} className={compactLogo ? "my-[3px] sm:my-0" : undefined} />
+        <span className={compactLogo ? "hidden sm:inline" : undefined}>HIGH</span>
       </span>
-      <span className="font-display text-lg font-extrabold leading-none tracking-tight text-fog">KICK</span>
+      <span
+        className={`font-display text-lg font-extrabold leading-none tracking-tight text-fog ${
+          compactLogo ? "hidden sm:inline" : ""
+        }`}
+      >
+        KICK
+      </span>
     </>
   );
 
@@ -132,7 +141,7 @@ export default function TopBar({
           <nav
             data-ui="mode-nav"
             aria-label="Feed"
-            className="flex min-w-0 shrink items-center gap-1 rounded-full border border-white/10 bg-smoke/80 p-1 backdrop-blur-md"
+            className="no-scrollbar flex min-w-0 shrink items-center gap-1 overflow-x-auto rounded-full border border-white/10 bg-smoke/80 p-1 backdrop-blur-md"
           >
             {tabs.map((tab) => {
               const Icon = tab.icon;
@@ -143,7 +152,7 @@ export default function TopBar({
                   onClick={() => onModeChange(tab.value)}
                   aria-pressed={isActive}
                   aria-label={t(tab.label)}
-                  className={`flex items-center gap-1 rounded-full px-2.5 py-1 font-mono text-xs font-semibold transition-colors sm:px-3 ${
+                  className={`flex shrink-0 items-center gap-1 rounded-full px-2 py-1 font-mono text-xs font-semibold transition-colors min-[360px]:px-2.5 sm:px-3 ${
                     isActive ? "bg-kick text-ink" : "text-fog/60 hover:text-fog"
                   }`}
                   title={t(tab.title)}
