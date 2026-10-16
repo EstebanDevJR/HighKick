@@ -15,8 +15,9 @@ import {
   type TrendingCategory,
   type TrendingChannel,
 } from "@/lib/kick/types";
-import { allPoolClips, getPools } from "@/lib/pools";
-import { mixedFeedPage, PAGE_SIZE } from "@/lib/recommend";
+import type { ClipScope } from "@/lib/kick";
+import { allPoolClips, getPools, getScopePool } from "@/lib/pools";
+import { mixedFeedPage, PAGE_SIZE, shuffledScopePage } from "@/lib/recommend";
 import {
   mergeBySlug,
   searchCategoriesLocal,
@@ -36,6 +37,14 @@ export async function getMixedFeed(
   favChannels: string[] = [],
 ): Promise<ClipsPage> {
   return mixedFeedPage(await getPools(), seed, page, favCategories, favChannels);
+}
+
+export async function getScopedMixFeed(
+  scope: ClipScope,
+  seed: string,
+  page: number,
+): Promise<ClipsPage> {
+  return shuffledScopePage(await getScopePool(scope), seed, page);
 }
 
 export const MAX_FOLLOWED = 30;

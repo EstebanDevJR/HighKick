@@ -134,6 +134,16 @@ export function mixedFeedPage(
   return pageOfDeck(deck, page);
 }
 
+// MIX inside one channel or category: there's a single pool, so the deck is
+// just its clips in seeded random order. Sorting by id first makes the deck
+// depend only on which clips exist, not on the order Kick listed them in.
+export function shuffledScopePage(clips: Clip[], seed: string, page: number): ClipsPage {
+  const unique = [...new Map(clips.map((c) => [c.id, c])).values()].sort((a, b) =>
+    a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+  );
+  return pageOfDeck(shuffle(unique, mulberry32(hashSeed(seed))), page);
+}
+
 export function randomSeed(): string {
   return Math.random().toString(36).slice(2, 10);
 }

@@ -12,6 +12,7 @@ import Hls from "hls.js";
 import { kickChannelUrl, kickClipUrl, type Clip } from "@/lib/kick/types";
 import { recordAffinity, watchSignal } from "@/lib/affinity";
 import { onClipCommand, type ClipCommand } from "@/lib/commands";
+import { isProgressiveUrl, markUnplayable, probeClip } from "@/lib/playable";
 import { formatCount, formatDuration, timeAgo } from "@/lib/format";
 import {
   followsStore,
@@ -58,6 +59,8 @@ interface ClipCardProps {
   // Returns true when the feed advanced to the next clip; false means the
   // clip should replay in place (last card, or auto-advance is off).
   onEnded: () => boolean;
+  // The video is gone from Kick's CDN; the feed drops the card.
+  onUnplayable?: () => void;
 }
 
 interface Burst {
@@ -84,6 +87,7 @@ export default function ClipCard({
   onToggleMute,
   onVolumeChange,
   onEnded,
+  onUnplayable,
 }: ClipCardProps) {
   const { t, locale } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -119,6 +123,21 @@ export default function ClipCard({
   const shouldLoad = active || preload;
   const linkTarget = embed ? "_blank" : undefined;
 
+  // A 4xx from the CDN settles it; any other fatal error (Safari only says
+  // "network" or "unsupported") is double-checked with a probe first, so a
+  // flaky connection or a codec quirk never hides a working clip.
+  const reportPlaybackError = useEffectEvent((rejectedByCdn: boolean) => {
+    if (!onUnplayable) return;
+    if (rejectedByCdn) {
+      markUnplayable(clip.id);
+      onUnplayable();
+      return;
+    }
+    void probeClip(clip, true).then((ok) => {
+      if (!ok) onUnplayable();
+    });
+  });
+
   // Attach the HLS source only while the card is on (or next to) screen,
   // and tear it down when it scrolls far away to keep memory bounded.
   useEffect(() => {
@@ -128,7 +147,11 @@ export default function ClipCard({
     // Prefer hls.js over native playback: Chrome answers "maybe" to the HLS
     // MIME type but can't actually demux it. Safari takes the native branch.
     let hls: Hls | null = null;
-    if (Hls.isSupported()) {
+    const onNativeError = () => reportPlaybackError(false);
+    if (isProgressiveUrl(clip.videoUrl)) {
+      video.addEventListener("error", onNativeError);
+      video.src = clip.videoUrl;
+    } else if (Hls.isSupported()) {
       const instance = new Hls({
         maxBufferLength: dataSaver ? 6 : 12,
         capLevelToPlayerSize: true,
@@ -143,14 +166,21 @@ export default function ClipCard({
           instance.autoLevelCapping = cap;
         });
       }
+      instance.on(Hls.Events.ERROR, (_event, data) => {
+        if (!data.fatal) return;
+        const status = data.response?.code ?? 0;
+        reportPlaybackError(status >= 400 && status < 500 && status !== 408 && status !== 429);
+      });
       instance.loadSource(clip.videoUrl);
       instance.attachMedia(video);
       hls = instance;
     } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.addEventListener("error", onNativeError);
       video.src = clip.videoUrl;
     }
 
     return () => {
+      video.removeEventListener("error", onNativeError);
       hls?.destroy();
       video.removeAttribute("src");
       video.load();

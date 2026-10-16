@@ -8,6 +8,7 @@ import {
   PAGE_SIZE,
   promoteFavorites,
   shuffle,
+  shuffledScopePage,
 } from "@/lib/recommend";
 import type { Pools } from "@/lib/pools";
 import { makeClip, range } from "./helpers";
@@ -83,4 +84,25 @@ test("favorites surface earlier without dropping anything", () => {
 test("an empty pool set yields an empty last page", () => {
   const empty: Pools = { day: [], week: [], month: [], fresh: [] };
   assert.deepEqual(mixedFeedPage(empty, "x", 0), { clips: [], nextCursor: null });
+});
+
+test("scoped MIX pages through every clip once, in a seed-stable order", () => {
+  const clips = range(45).map((i) => makeClip(i));
+  const withDupes = [...clips, ...clips.slice(0, 10)];
+
+  const ids: string[] = [];
+  for (let page = 0; ; page++) {
+    const { clips: chunk, nextCursor } = shuffledScopePage(withDupes, "abc", page);
+    ids.push(...chunk.map((c) => c.id));
+    if (!nextCursor) break;
+    assert.equal(nextCursor, String(page + 1));
+  }
+  assert.equal(ids.length, 45);
+  assert.equal(new Set(ids).size, 45);
+
+  // Kick listing order doesn't matter, the seed does.
+  const reversed = shuffledScopePage([...clips].reverse(), "abc", 0).clips.map((c) => c.id);
+  assert.deepEqual(reversed, ids.slice(0, PAGE_SIZE));
+  const other = shuffledScopePage(clips, "xyz", 0).clips.map((c) => c.id);
+  assert.notDeepEqual(other, ids.slice(0, PAGE_SIZE));
 });
