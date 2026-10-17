@@ -3,10 +3,11 @@ import type { Pools } from "@/lib/pools";
 
 // The "MIX" feed. Kick's API only offers deterministic sorts, so refreshing
 // always returned the same clips in the same order. This builds a
-// recommendation deck instead: several pools are fetched (trending today,
-// this week, this month, and the freshest uploads), each pool is shuffled
-// with a seeded RNG, and the deck is assembled by weighted round-robin
-// sampling across pools. A new seed on every page load means a new order,
+// recommendation deck instead: several listings are fetched (trending today,
+// this week, this month, all-time classics and the freshest uploads), their
+// clips are grouped by actual age and shuffled with a seeded RNG, and the
+// deck is assembled by weighted sampling across ages. A new seed on every
+// page load means a new order,
 // while the same seed keeps pagination stable within one session.
 //
 // Everything in this module is pure (pools in, deck out) so it can be unit
@@ -48,27 +49,76 @@ export function shuffle<T>(items: T[], rand: () => number): T[] {
   return out;
 }
 
-export function buildDeck(pools: Pools, seed: string): Clip[] {
+// Kick's listings are labelled by window ("top this week"), not by age: the
+// week and month tops are dominated by the biggest clips of the last few
+// days, and a channel's all-time top is mostly years old. So the deck is
+// built from each clip's actual age instead — today, this week, this month,
+// this year, older — and the weights decide how often each age gets the
+// next slot.
+export type AgeBucket = "day" | "week" | "month" | "year" | "older";
+
+const DAY_MS = 86_400_000;
+const AGE_LIMITS: [AgeBucket, number][] = [
+  ["day", DAY_MS],
+  ["week", 7 * DAY_MS],
+  ["month", 30 * DAY_MS],
+  ["year", 365 * DAY_MS],
+];
+
+export function ageBucket(createdAt: string, anchor: number): AgeBucket {
+  const t = Date.parse(createdAt);
+  if (Number.isNaN(t)) return "older";
+  const age = anchor - t;
+  for (const [bucket, limit] of AGE_LIMITS) if (age < limit) return bucket;
+  return "older";
+}
+
+// The home deck stays mostly fresh but keeps reaching back; a channel's
+// own MIX is evenly spread, since its whole history is the point.
+export const HOME_WEIGHTS: Record<AgeBucket, number> = {
+  day: 0.35,
+  week: 0.27,
+  month: 0.22,
+  year: 0.1,
+  older: 0.06,
+};
+export const SCOPE_WEIGHTS: Record<AgeBucket, number> = {
+  day: 0.2,
+  week: 0.2,
+  month: 0.2,
+  year: 0.2,
+  older: 0.2,
+};
+
+export function ageBalancedDeck(
+  clips: Clip[],
+  seed: string,
+  weights: Record<AgeBucket, number>,
+): Clip[] {
   const rand = mulberry32(hashSeed(seed));
+  // Sorting by id makes the deck depend only on which clips exist, not on
+  // the order Kick listed them in.
+  const unique = [...new Map(clips.map((c) => [c.id, c])).values()].sort((a, b) =>
+    a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+  );
+  // Ages are measured from the newest clip rather than the clock, so a
+  // deck doesn't reshuffle itself between pages as time passes.
+  const anchor = Math.max(0, ...unique.map((c) => Date.parse(c.createdAt) || 0));
 
-  // Weights decide how often each pool gets the next slot: mostly what's hot
-  // today, with steady doses of weekly/monthly hits and brand-new clips so
-  // small streamers surface too.
-  const weighted: WeightedPool[] = [
-    { clips: shuffle(pools.day, rand), weight: 0.4 },
-    { clips: shuffle(pools.week, rand), weight: 0.25 },
-    { clips: shuffle(pools.month, rand), weight: 0.15 },
-    { clips: shuffle(pools.fresh, rand), weight: 0.2 },
-  ];
+  const byAge = new Map<AgeBucket, Clip[]>();
+  for (const clip of unique) {
+    const bucket = ageBucket(clip.createdAt, anchor);
+    byAge.set(bucket, [...(byAge.get(bucket) ?? []), clip]);
+  }
 
-  const seen = new Set<string>();
+  const weighted: WeightedPool[] = (Object.keys(weights) as AgeBucket[]).map((bucket) => ({
+    clips: shuffle(byAge.get(bucket) ?? [], rand),
+    weight: weights[bucket],
+  }));
+
   const deck: Clip[] = [];
-
   while (weighted.some((p) => p.clips.length > 0)) {
-    const total = weighted.reduce(
-      (sum, p) => sum + (p.clips.length > 0 ? p.weight : 0),
-      0,
-    );
+    const total = weighted.reduce((sum, p) => sum + (p.clips.length > 0 ? p.weight : 0), 0);
     let pick = rand() * total;
     let chosen: WeightedPool | null = null;
     for (const pool of weighted) {
@@ -80,15 +130,17 @@ export function buildDeck(pools: Pools, seed: string): Clip[] {
       }
     }
     chosen ??= weighted.find((p) => p.clips.length > 0)!;
-
-    const clip = chosen.clips.pop()!;
-    if (!seen.has(clip.id)) {
-      seen.add(clip.id);
-      deck.push(clip);
-    }
+    deck.push(chosen.clips.pop()!);
   }
-
   return deck;
+}
+
+export function buildDeck(pools: Pools, seed: string): Clip[] {
+  return ageBalancedDeck(
+    [...pools.day, ...pools.week, ...pools.month, ...pools.fresh, ...pools.all],
+    seed,
+    HOME_WEIGHTS,
+  );
 }
 
 // Taste-based promotion: clips matching the client's favorite channels or
@@ -134,14 +186,10 @@ export function mixedFeedPage(
   return pageOfDeck(deck, page);
 }
 
-// MIX inside one channel or category: there's a single pool, so the deck is
-// just its clips in seeded random order. Sorting by id first makes the deck
-// depend only on which clips exist, not on the order Kick listed them in.
-export function shuffledScopePage(clips: Clip[], seed: string, page: number): ClipsPage {
-  const unique = [...new Map(clips.map((c) => [c.id, c])).values()].sort((a, b) =>
-    a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
-  );
-  return pageOfDeck(shuffle(unique, mulberry32(hashSeed(seed))), page);
+// MIX inside one channel or category: the same age-balanced deck, spread
+// evenly across the scope's history.
+export function scopedMixPage(clips: Clip[], seed: string, page: number): ClipsPage {
+  return pageOfDeck(ageBalancedDeck(clips, seed, SCOPE_WEIGHTS), page);
 }
 
 export function randomSeed(): string {
