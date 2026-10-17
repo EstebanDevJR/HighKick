@@ -17,7 +17,7 @@ import {
 } from "@/lib/kick/types";
 import type { ClipScope } from "@/lib/kick";
 import { allPoolClips, getPools, getScopePool } from "@/lib/pools";
-import { mixedFeedPage, PAGE_SIZE, shuffledScopePage } from "@/lib/recommend";
+import { mixedFeedPage, PAGE_SIZE, scopedMixPage } from "@/lib/recommend";
 import {
   mergeBySlug,
   searchCategoriesLocal,
@@ -44,7 +44,7 @@ export async function getScopedMixFeed(
   seed: string,
   page: number,
 ): Promise<ClipsPage> {
-  return shuffledScopePage(await getScopePool(scope), seed, page);
+  return scopedMixPage(await getScopePool(scope), seed, page);
 }
 
 export const MAX_FOLLOWED = 30;

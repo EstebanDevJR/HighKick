@@ -4,6 +4,7 @@
 
 - **Dead clips are skipped.** Kick still lists clips whose video is gone from its CDN (mostly old ones), which used to spin forever. Upcoming clips are probed and anything the CDN rejects is dropped from every feed and remembered locally; network hiccups never hide a clip.
 - **MIX on channel and category pages:** a shuffled, seed-stable deck of that streamer's (or category's) clips next to TOP and NEW.
+- **MIX spans every age.** Decks are now built from each clip's real age (today / this week / this month / this year / older) instead of trusting Kick's "top this week/month" labels, which are dominated by the last few days. The home MIX stays mostly fresh but reliably reaches back weeks, months and to all-time hits; a channel's MIX is spread evenly across its history instead of only today's clips and years-old ones.
 - English is now the default language for everyone; Spanish and Portuguese are picked in Settings (the browser's `Accept-Language` is no longer used).
 - Phones: the time-range chip no longer covers the MIX / TOP / NEW selector — the logo shrinks to the bolt instead.
 - Explore: the trending streamers row gets scroll arrows on desktop, where a mouse wheel couldn't move it sideways.
